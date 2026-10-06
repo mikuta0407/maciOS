@@ -25,7 +25,7 @@ struct FloatingWindow<Content: View>: View {
     @State private var windowID: WindowID
     
     init(title: String, nativeWindow: AnyWindowRepresentable? = nil,@ViewBuilder content: @escaping () -> Content, nsWindow: NSWindow? = nil) {
-        self.title = title
+        self._title = State(initialValue: title)
         self.content = content
         self.nativeWindow = nativeWindow
         self.nsWindow = nsWindow
@@ -298,9 +298,9 @@ struct UIViewWrapper<Content: UIView>: UIViewRepresentable {
 
 extension FloatingWindow where Content == UIViewWrapper<UIView> {
     init(title: String, uiView: UIView, windowSize: CGRect, nativeWindow: AnyWindowRepresentable? = nil) {
-        self.title = title
-        self.windowSize = windowSize
-        self.currentSize = windowSize.size
+        self._title = State(initialValue: title)
+        self._windowSize = State(initialValue: windowSize)
+        self._currentSize = State(initialValue: windowSize.size)
         self.content = { UIViewWrapper(uiView: uiView) }
         self.uikit = true
         self.nsWindow = nil
@@ -309,9 +309,9 @@ extension FloatingWindow where Content == UIViewWrapper<UIView> {
     }
     
     init(window: NSWindow) {
-        self.title = window.title ?? ""
-        self.windowSize = window.frame
-        self.currentSize = window.frame.size
+        self._title = State(initialValue: window.title ?? "")
+        self._windowSize = State(initialValue: window.frame)
+        self._currentSize = State(initialValue: window.frame.size)
         self.content = { UIViewWrapper(uiView: window.contentView.uiView) }
         self.uikit = true
         self.nsWindow = window
