@@ -56,6 +56,7 @@ struct ContentView: View {
         let bash = Execute.rootDirectory.appendingPathComponent("bin/bash")
         guard FileManager.default.fileExists(atPath: bash.path) else {
             NSLog("No guest root at %@; not starting a shell", Execute.rootDirectory.path)
+            fputs("maciOS: no guest root at \(Execute.rootDirectory.path); not starting a shell\n", stderr)
             return
         }
         let started = Date()

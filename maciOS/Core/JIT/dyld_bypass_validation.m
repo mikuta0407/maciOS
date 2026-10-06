@@ -128,11 +128,23 @@ int ios_major_version(void) {
 }
 
 
-static bool has_txm(void) {
-    if (ios_major_version() < 19) {
-        return false;
-    }
-    
+// Same check as StikDebug and LiveContainer (from Dopamine): the device tree
+// lists a TXM region. IOKit is looked up at run time, as iOS has no headers for it.
+static bool has_txm_in_device_tree(void) {
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+    if (!iokit) return false;
+    uint32_t (*fromPath)(mach_port_t, const char *) = dlsym(iokit, "IORegistryEntryFromPath");
+    CFTypeRef (*createProperty)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t) = dlsym(iokit, "IORegistryEntryCreateCFProperty");
+    kern_return_t (*release)(uint32_t) = dlsym(iokit, "IOObjectRelease");
+    if (!fromPath || !createProperty || !release) return false;
+    uint32_t memoryMap = fromPath(0, "IODeviceTree:/chosen/memory-map");
+    if (!memoryMap) return false;
+    NSArray *keys = (__bridge_transfer NSArray *)createProperty(memoryMap, CFSTR("IORegistryEntryPropertyKeys"), NULL, 0);
+    release(memoryMap);
+    return [keys isKindOfClass:NSArray.class] && [keys containsObject:@"TXM"];
+}
+
+static bool has_txm_firmware(void) {
     char *boot = file_path_with_length("/System/Volumes/Preboot", 36);
     if (boot) {
         char *boot_inner = file_path_with_length(boot, 96);
@@ -159,14 +171,28 @@ static bool has_txm(void) {
     return false;
 }
 
+// Set before the dyld hooks are, which run with dyld's lock held.
+static bool txm;
+
+// Diagnostics from inside the hooks: NSLog may take dyld's lock.
+static void hook_log(const char *format, ...) {
+    char line[256];
+    va_list args;
+    va_start(args, format);
+    int length = vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    if (length > 0) write(STDERR_FILENO, line, MIN((size_t)length, sizeof(line) - 1));
+}
+
 static void* common_hooked_mmap(mmap_p orig, void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
     void *map = orig(addr, len, prot, flags, fd, offset);
     if (map == MAP_FAILED && fd && (prot & PROT_EXEC)) {
         
         map = __mmap(addr, len, prot, flags | MAP_PRIVATE | MAP_ANON, 0, 0);
-        if (has_txm()) {
+        if (txm) {
             BreakMarkJITMapping((vm_address_t)map, len);
         }
+        hook_log("[DyldLVBypass] mapped %zu bytes at %p for fd %d (txm %d)\n", len, map, fd, txm);
         
         void *memoryLoadedFile = __mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, offset);
         // mirror `addr` (rx, JIT applied) to `mirrored` (rw)
@@ -178,6 +204,8 @@ static void* common_hooked_mmap(mmap_p orig, void *addr, size_t len, int prot, i
                     VM_PROT_READ | VM_PROT_WRITE);
             memcpy((void*)mirrored, memoryLoadedFile, len);
             vm_deallocate(mach_task_self(), mirrored, len);
+        } else {
+            hook_log("[DyldLVBypass] vm_remap of %p failed: %d\n", map, ret);
         }
         munmap(memoryLoadedFile, len);
     }
@@ -233,7 +261,9 @@ void init_bypassDyldLibValidation(void) {
     if (bypassed) return;
     bypassed = YES;
 
-    NSLog(@"[DyldLVBypass] init");
+    bool inDeviceTree = has_txm_in_device_tree(), firmware = has_txm_firmware();
+    txm = inDeviceTree || firmware;
+    NSLog(@"[DyldLVBypass] init (TXM: device tree %d, firmware %d)", inDeviceTree, firmware);
     
     // Modifying exec page during execution may cause SIGBUS, so ignore it now
     // Only comment this out if only one thread (main) is running

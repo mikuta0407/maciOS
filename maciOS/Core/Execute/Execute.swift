@@ -240,6 +240,7 @@ class Execute: NSObject {
             if let error = dlerror() {
                 let message = String(cString: error)
                 NSLog("Failed to load dylib: %@", message)
+                fputs("maciOS: could not load \(programName ?? dylibPath): \(message)\n", stderr)
             }
             return false
         }

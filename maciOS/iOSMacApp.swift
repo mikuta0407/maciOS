@@ -14,6 +14,12 @@ import UIKit
 struct maciOSApp: App {
     @StateObject private var mouse = MouseTracker.shared
     @State var cursor = UIImage()
+
+    init() {
+        // On a device NSLog only reaches the system log; send it to stderr too,
+        // so it shows in the app logs and Documents/maciOS.log.
+        setenv("CFLOG_FORCE_STDERR", "1", 1)
+    }
     
     var body: some Scene {
         WindowGroup {

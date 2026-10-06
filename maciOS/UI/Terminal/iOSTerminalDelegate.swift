@@ -19,6 +19,9 @@ class iOSTerminalDelegate: NSObject, TerminalViewDelegate, ObservableObject {
     
     private var originalStdout: Int32 = -1
     private var originalStderr: Int32 = -1
+    /// Documents/maciOS.log: stderr of this launch, host logs included, for
+    /// reading in the Files app when something goes wrong on a device.
+    private var logFile: Int32 = -1
     
     var terminalView: TerminalView?
     
@@ -44,6 +47,7 @@ class iOSTerminalDelegate: NSObject, TerminalViewDelegate, ObservableObject {
         
         originalStdout = dup(STDOUT_FILENO)
         originalStderr = dup(STDERR_FILENO)
+        logFile = open(URL.documentsDirectory.appendingPathComponent("maciOS.log").path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         
         setvbuf(stdout, nil, _IONBF, 0)
         setvbuf(stderr, nil, _IONBF, 0)
@@ -69,6 +73,7 @@ class iOSTerminalDelegate: NSObject, TerminalViewDelegate, ObservableObject {
             let data = handle.availableData
             guard let self, !data.isEmpty else { return }
             self.mirror(data, to: self.originalStderr)
+            self.mirror(data, to: self.logFile)
             let visible = self.filterHostLogs(data)
             if !visible.isEmpty {
                 self.feed(vtty_process_output(visible))
@@ -112,7 +117,10 @@ class iOSTerminalDelegate: NSObject, TerminalViewDelegate, ObservableObject {
     }
     
     private func isHostLog(_ line: String) -> Bool {
-        if line.contains("\(Bundle.main.bundleName)["), line.contains("]"), line.contains(":") { return true }
+        // In LiveContainer the process is LiveContainer's, not maciOS.
+        for name in [Bundle.main.bundleName, ProcessInfo.processInfo.processName] {
+            if line.contains("\(name)["), line.contains("]"), line.contains(":") { return true }
+        }
         if line.contains("OSLOG-"), !line.contains("Failed to load dylib: dlopen") { return true }
         return false
     }
