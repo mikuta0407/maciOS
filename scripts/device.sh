@@ -93,6 +93,7 @@ jit() {
     pid="${1:-}"
     [ -n "$pid" ] || die "usage: jit <pid of maciOS>"
     pkill -f "maciOS_jit.py" 2>/dev/null || true
+    rm -f "$OUT/stacks-request"
     nohup xcrun lldb --batch -o "command script import scripts/maciOS_jit.py" \
         -o "maciOS_jit $DEVICE_ID $pid $OUT/stacks-request" >"$OUT/jit.log" 2>&1 &
     for _ in $(seq 60); do

@@ -189,12 +189,18 @@ def run(debugger, device, pid, dump_request):
             os.remove(dump_request)
 
 
+def describe(frame):
+    """A frame without its arguments, which lldb is slow to show for guests."""
+    module = frame.GetModule().GetFileSpec().GetFilename() or "?"
+    return f"#{frame.GetFrameID()} {frame.GetPC():#x} {module}`{frame.GetFunctionName() or '?'}"
+
+
 def dump_threads(process):
     for thread in process:
         log(f"thread {thread.GetThreadID():#x} {thread.GetName() or ''} {thread.GetQueueName() or ''} "
             f"stop={thread.GetStopDescription(128)!r} pc={thread.GetFrameAtIndex(0).GetPC():#x}")
         for frame in list(thread)[:30]:
-            log(f"  {frame}")
+            log(f"  {describe(frame)}")
     log("end of threads")
 
 
@@ -205,7 +211,7 @@ def trapped(process):
                 and brk_immediate(process, thread.GetFrameAtIndex(0).GetPC()) is not None:
             log("maciOS trapped; killing it")
             for frame in thread:
-                log(f"  {frame}")
+                log(f"  {describe(frame)}")
             process.Kill()
             return True
     return False
