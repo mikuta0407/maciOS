@@ -1,0 +1,8 @@
+#!/bin/sh
+for arg; do
+  case "$arg" in
+    --pkg-info=*|--files=*) echo "No receipt for '${arg#*=}' found at '/'." >&2; exit 1 ;;
+    --pkg-info|--files) shift; echo "No receipt for '${2:-}' found at '/'." >&2; exit 1 ;;
+  esac
+done
+exit 0

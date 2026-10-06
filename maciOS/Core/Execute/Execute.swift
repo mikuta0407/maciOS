@@ -26,6 +26,7 @@ class Execute: NSObject {
             return true
         }
         try? FileManager.default.removeItem(at: instanceDirectory)
+        installBundledRoot()
         guest_root_set(rootDirectory.path)
         // Patched images refer to each other by absolute path, which changes
         // when the app's container moves.
@@ -39,6 +40,46 @@ class Execute: NSObject {
 
     /// Stands in for /bin, /usr and /etc; see GuestRoot.h.
     static let rootDirectory = URL.documentsDirectory.appendingPathComponent("root")
+
+    /// Copies the guest root built into the app (scripts/embed-guest-root.sh)
+    /// over Documents/root when it is a different build. Files the root does
+    /// not have are left alone.
+    private static func installBundledRoot() {
+        let fileManager = FileManager.default
+        guard let bundled = Bundle.main.url(forResource: "GuestRoot", withExtension: nil) else { return }
+        let versionName = ".maciOS-root-version"
+        let version = try? String(contentsOf: bundled.appendingPathComponent(versionName), encoding: .utf8)
+        let installedVersion = try? String(contentsOf: rootDirectory.appendingPathComponent(versionName), encoding: .utf8)
+        guard let version, version != installedVersion else { return }
+
+        guard let entries = fileManager.enumerator(at: bundled, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }
+        let base = bundled.standardizedFileURL.path
+        for case let entry as URL in entries {
+            let relative = String(entry.standardizedFileURL.path.dropFirst(base.count + 1))
+            if relative.hasPrefix(".maciOS-root-") { continue }
+            let target = rootDirectory.appendingPathComponent(relative)
+            let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            do {
+                if values?.isDirectory == true && values?.isSymbolicLink != true {
+                    try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
+                } else {
+                    if (try? fileManager.attributesOfItem(atPath: target.path)) != nil {
+                        try fileManager.removeItem(at: target)
+                    }
+                    try fileManager.copyItem(at: entry, to: target)
+                }
+            } catch {
+                NSLog("Could not install %@ into the guest root: %@", relative, error.localizedDescription)
+                return
+            }
+        }
+        // Installing the app dropped the files' modes.
+        let executables = (try? String(contentsOf: bundled.appendingPathComponent(".maciOS-root-executables"), encoding: .utf8)) ?? ""
+        for relative in executables.split(separator: "\n") {
+            try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rootDirectory.appendingPathComponent(String(relative)).path)
+        }
+        try? version.write(to: rootDirectory.appendingPathComponent(versionName), atomically: true, encoding: .utf8)
+    }
 
     /// Patched copies of executables that guests start, keyed by the original's path, size and mtime.
     static let imageCacheDirectory = URL.cachesDirectory.appendingPathComponent("GuestImages")

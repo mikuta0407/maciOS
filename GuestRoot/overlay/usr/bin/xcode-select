@@ -1,0 +1,5 @@
+#!/bin/sh
+case "${1:-}" in
+  -v|--version) echo "xcode-select version 2412." ;;
+  *) echo "xcode-select: error: unable to get active developer directory" >&2; exit 2 ;;
+esac

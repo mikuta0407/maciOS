@@ -1,0 +1,12 @@
+#!/bin/bash
+# shasum(1) on top of the coreutils sha*sum tools: `shasum [-a bits] [file ...]`.
+bits=1
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -a) bits="$2"; shift 2 ;;
+    -a*) bits="${1#-a}"; shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+exec "sha${bits}sum" "${args[@]}"

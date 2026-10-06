@@ -178,6 +178,7 @@
 				4E2C5E442E59E9450037BD64 /* Embed Frameworks */,
 				4E01E2752E6063F80018FDE6 /* Embed App Extensions */,
 				4EC1A0012F00000000000001 /* Embed Simulator Dependencies */,
+				4EC1A0022F00000000000002 /* Embed Guest Root */,
 			);
 			buildRules = (
 			);
@@ -277,6 +278,25 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "\"${SRCROOT}/scripts/embed-simulator-dependencies.sh\"\n";
+		};
+		4EC1A0022F00000000000002 /* Embed Guest Root */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Embed Guest Root";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${SRCROOT}/scripts/embed-guest-root.sh\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
