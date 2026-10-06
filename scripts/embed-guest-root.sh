@@ -15,8 +15,15 @@ if ! "${SRCROOT}/GuestRoot/build-root.sh" "${BUILT}"; then
     exit 0
 fi
 rm -rf "${RESOURCES}/GuestRoot"
-if ! cmp -s "${BUILT}/.maciOS-root-version" "${RESOURCES}/GuestRoot.version"; then
+# Bumped when the archive is made differently, to remake it.
+ARCHIVE_FORMAT=2
+STAMP="${PROJECT_TEMP_DIR}/GuestRoot/archive-stamp"
+if ! cmp -s "${BUILT}/.maciOS-root-version" "${RESOURCES}/GuestRoot.version" ||
+   [ "$(cat "${STAMP}" 2>/dev/null)" != "${ARCHIVE_FORMAT}" ]; then
     rm -f "${RESOURCES}/GuestRoot.aar"
-    aa archive -d "${BUILT}" -o "${RESOURCES}/GuestRoot.aar"
+    # Owners, flags and extended attributes are this Mac's; on a device the
+    # app may not set them, which fails the whole extraction.
+    aa archive -d "${BUILT}" -o "${RESOURCES}/GuestRoot.aar" -exclude-field uid,gid,flg,xat,acl,ctm,btm
     cp "${BUILT}/.maciOS-root-version" "${RESOURCES}/GuestRoot.version"
+    echo "${ARCHIVE_FORMAT}" > "${STAMP}"
 fi

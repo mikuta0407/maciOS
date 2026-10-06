@@ -57,7 +57,10 @@ class Execute: NSObject {
         let fileManager = FileManager.default
         guard let archive = Bundle.main.url(forResource: "GuestRoot", withExtension: "aar"),
               let versionURL = Bundle.main.url(forResource: "GuestRoot", withExtension: "version"),
-              let version = try? String(contentsOf: versionURL, encoding: .utf8) else { return }
+              let version = try? String(contentsOf: versionURL, encoding: .utf8) else {
+            fputs("maciOS: the app has no guest root (GuestRoot.aar) in \(Bundle.main.bundlePath)\n", stderr)
+            return
+        }
         let installedVersionURL = rootDirectory.appendingPathComponent(".maciOS-root-version")
         guard version != (try? String(contentsOf: installedVersionURL, encoding: .utf8)) else { return }
 
@@ -68,6 +71,7 @@ class Execute: NSObject {
             try extractArchive(archive, to: staging)
         } catch {
             NSLog("Could not extract the guest root: %@", error.localizedDescription)
+            fputs("maciOS: could not extract the guest root: \(error)\n", stderr)
             return
         }
 
@@ -90,6 +94,7 @@ class Execute: NSObject {
                 }
             } catch {
                 NSLog("Could not install %@ into the guest root: %@", relative, error.localizedDescription)
+                fputs("maciOS: could not install \(relative) into the guest root: \(error)\n", stderr)
                 return
             }
         }
@@ -107,9 +112,10 @@ class Execute: NSObject {
         defer { try? decompressed.close() }
         guard let decoder = ArchiveStream.decodeStream(readingFrom: decompressed) else { throw ArchiveError() }
         defer { try? decoder.close() }
-        guard let extractor = ArchiveStream.extractStream(extractingTo: FilePath(directory.path)) else { throw ArchiveError() }
+        // The app cannot set some attributes on a device (owners, for one); the files matter, not those.
+        guard let extractor = ArchiveStream.extractStream(extractingTo: FilePath(directory.path), flags: [.ignoreOperationNotPermitted]) else { throw ArchiveError() }
         defer { try? extractor.close() }
-        _ = try ArchiveStream.process(readingFrom: decoder, writingTo: extractor)
+        _ = try ArchiveStream.process(readingFrom: decoder, writingTo: extractor, flags: [.ignoreOperationNotPermitted])
     }
 
     /// Changed when patched images are made differently, to drop older ones.
