@@ -2407,6 +2407,26 @@ __attribute__((noreturn)) static void hook_verrc(int status, int code, const cha
 // Absolute paths under /bin, /usr and /etc go through the guest root.
 #define MAP_PATH(path) char path##_buffer[PATH_MAX]; path = guest_root_map(path, path##_buffer)
 
+/// Guests may not take the app's last descriptors (its terminal input and
+/// output need some): an open that gets a number this high fails with
+/// EMFILE. Descriptors are handed out lowest first, so the number tells how
+/// many are in use. notify's kqueue watcher (fresh), for one, can walk a
+/// whole tree and open every file in it. The kernel allows at most OPEN_MAX
+/// whatever the soft limit says.
+static int guest_keep_fd(int fd) {
+    static int ceiling;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct rlimit limit;
+        rlim_t most = getrlimit(RLIMIT_NOFILE, &limit) == 0 ? MIN(limit.rlim_cur, (rlim_t)OPEN_MAX) : 256;
+        ceiling = (int)(most > 2048 ? most - 1024 : most * 3 / 4);
+    });
+    if (fd < ceiling) return fd;
+    close(fd);
+    errno = EMFILE;
+    return -1;
+}
+
 /// N for "/dev/fd/N", else -1. A device's sandbox hides /dev/fd, which
 /// bash's process substitution (`<(...)`) hands to commands.
 static int dev_fd_number(const char *path) {
@@ -2435,7 +2455,7 @@ static int hook_open(const char *path, int flags, ...) {
         va_end(args);
     }
     MAP_PATH(path);
-    int fd = open(path, flags, mode);
+    int fd = guest_keep_fd(open(path, flags, mode));
     vfork_ctx *c = child_ctx();
     return c ? child_adopt(c, fd, (flags & O_CLOEXEC) != 0) : fd;
 }
@@ -2454,7 +2474,7 @@ static int hook_openat(int fd, const char *path, int flags, ...) {
     MAP_PATH(path);
     vfork_ctx *c = child_ctx();
     if (c && fd >= 0) fd = map_fd(fd, 0);
-    int result = openat(fd, path, flags, mode);
+    int result = guest_keep_fd(openat(fd, path, flags, mode));
     return c ? child_adopt(c, result, (flags & O_CLOEXEC) != 0) : result;
 }
 

@@ -40,6 +40,7 @@ struct ContentView: View {
             setupTerminal()
             #if DEBUG
             startDebugInputFeed()
+            startDescriptorCensus()
             if ProcessInfo.processInfo.arguments.contains("-maciOSRun") {
                 runExecutableFromLaunchArguments()
                 return
@@ -103,6 +104,43 @@ struct ContentView: View {
     /// Bytes written to Documents/.maciOS-input are typed into the terminal, so
     /// interactive programs can be driven from the host while testing in the simulator.
     private static var inputFeedStarted = false
+
+    /// Logs to the trace, every 5 seconds, how many descriptors the app has
+    /// open and of which kinds, with the directories most files are in, to
+    /// find guests that run the app out of them.
+    private func startDescriptorCensus() {
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            var kinds: [String: Int] = [:]
+            var directories: [String: Int] = [:]
+            var total = 0
+            var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            for fd in 0..<Int32(65_536) where fcntl(fd, F_GETFD) != -1 {
+                total += 1
+                var st = stat()
+                let kind: String
+                if fstat(fd, &st) != 0 {
+                    kind = "?"
+                } else {
+                    switch st.st_mode & S_IFMT {
+                    case S_IFREG: kind = "file"
+                    case S_IFDIR: kind = "dir"
+                    case S_IFIFO: kind = "pipe"
+                    case S_IFSOCK: kind = "socket"
+                    case S_IFCHR: kind = "chr"
+                    default: kind = "other"
+                    }
+                }
+                kinds[kind, default: 0] += 1
+                if kind == "file" || kind == "dir", fcntl(fd, F_GETPATH, &path) != -1 {
+                    let parent = (String(cString: path) as NSString).deletingLastPathComponent
+                    directories[parent, default: 0] += 1
+                }
+            }
+            let top = directories.sorted { $0.value > $1.value }.prefix(3)
+                .map { "\($0.value) in \(($0.key as NSString).lastPathComponent)" }
+            maciOS_trace_line("fds: \(total) \(kinds.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " ")); \(top.joined(separator: ", "))")
+        }
+    }
 
     private func startDebugInputFeed() {
         // onAppear can run more than once; two feeds would type everything twice.

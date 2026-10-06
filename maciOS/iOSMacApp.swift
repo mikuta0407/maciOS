@@ -21,6 +21,7 @@ struct maciOSApp: App {
         setenv("CFLOG_FORCE_STDERR", "1", 1)
         maciOS_trace_start()
         maciOS_trace_line("app: started")
+        Self.raiseFileLimit()
         // Before any view appears: the terminal's shell is loaded from
         // ContentView's onAppear, which runs before this scene's.
         setenv("LC_HOME_PATH", getenv("HOME"), 1)
@@ -29,6 +30,24 @@ struct maciOSApp: App {
         #endif
     }
     
+    /// Guests share the app's descriptors, and the default soft limit on a
+    /// device is 256. The kernel still allows at most OPEN_MAX (10240), and
+    /// guests are kept below that (guest_keep_fd in GuestSpawn.m). The
+    /// highest soft limit it takes is not readable (sysctl is denied), so try
+    /// large ones first.
+    private static func raiseFileLimit() {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return }
+        let before = limit.rlim_cur
+        for candidate: rlim_t in [1 << 20, 262_144, 65_536, 32_768, 24_576, 16_384, 10_240] where candidate > before {
+            var raised = limit
+            raised.rlim_cur = min(candidate, limit.rlim_max)
+            if setrlimit(RLIMIT_NOFILE, &raised) == 0 { break }
+        }
+        getrlimit(RLIMIT_NOFILE, &limit)
+        maciOS_trace_line("app: open file limit \(before) -> \(limit.rlim_cur)")
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
