@@ -79,8 +79,13 @@ install_app() {
 
 launch() {
     # maciOS hooks dyld, then waits for the debugger before loading the shell.
-    xcrun devicectl device process launch --device "$DEVICE_ID" --terminate-existing \
-        --quiet --json-output "$OUT/launch.json" "$BUNDLE_ID" >/dev/null
+    # devicectl sometimes cannot tell the pid of what it launched: retry.
+    for attempt in 1 2 3; do
+        xcrun devicectl device process launch --device "$DEVICE_ID" --terminate-existing \
+            --quiet --json-output "$OUT/launch.json" "$BUNDLE_ID" >/dev/null 2>"$OUT/launch.err" && break
+        [ "$attempt" = 3 ] && { cat "$OUT/launch.err" >&2; die "could not launch maciOS"; }
+        sleep 3
+    done
     pid=$(/usr/bin/python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["result"]["process"]["processIdentifier"])' "$OUT/launch.json")
     echo "launched maciOS (pid $pid)"
     jit "$pid"
@@ -110,7 +115,7 @@ type_text() {
     printf '%b' "$1" >"$OUT/input"
     # The app takes the file as soon as it lands, which devicectl then
     # reports as a failure to find it: that is success.
-    xcrun devicectl device copy to --device "$DEVICE_ID" --quiet \
+    xcrun devicectl device copy to --device "$DEVICE_ID" --timeout 30 --quiet \
         --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
         --source "$OUT/input" --destination Documents/.maciOS-input >"$OUT/type.log" 2>&1 ||
         grep -q "Failed to retrieve the file node" "$OUT/type.log" || { cat "$OUT/type.log" >&2; return 1; }
@@ -130,7 +135,7 @@ stacks() {
 
 pull() {
     for file in maciOS-trace.log maciOS.log maciOS-terminal.log; do
-        xcrun devicectl device copy from --device "$DEVICE_ID" --quiet \
+        xcrun devicectl device copy from --device "$DEVICE_ID" --timeout 30 --quiet \
             --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
             --source "Documents/$file" --destination "$OUT/$file" &&
             echo "$OUT/$file"
@@ -138,7 +143,7 @@ pull() {
 }
 
 screen() {
-    xcrun devicectl device copy from --device "$DEVICE_ID" --quiet \
+    xcrun devicectl device copy from --device "$DEVICE_ID" --timeout 30 --quiet \
         --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
         --source Documents/maciOS-terminal.log --destination "$OUT/maciOS-terminal.log" >/dev/null
     # Drop escape sequences and carriage returns, keep the text.
@@ -148,7 +153,7 @@ screen() {
 
 shot() {
     file="${1:-$OUT/screenshot.png}"
-    xcrun devicectl device capture screenshot --device "$DEVICE_ID" --quiet --destination "$file"
+    xcrun devicectl device capture screenshot --device "$DEVICE_ID" --timeout 30 --quiet --destination "$file"
     echo "$file"
 }
 

@@ -12,7 +12,11 @@
 set -euo pipefail
 
 # Formulae whose programs make up the root. Their dependencies come along.
-FORMULAE=(bash uutils-coreutils curl libarchive gnu-sed grep gzip findutils gnu-tar)
+# git is here rather than installed with Homebrew: its bottle cannot be
+# relocated to a prefix as long as the app's container. Guests get
+# GIT_EXEC_PATH and GIT_TEMPLATE_DIR for its helpers and templates
+# (Execute.setEnvironmentVariables).
+FORMULAE=(bash uutils-coreutils curl libarchive gnu-sed grep gzip findutils gnu-tar git)
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT="${1:?usage: build-root.sh OUTPUT [WORK]}"
@@ -53,6 +57,9 @@ for d in "$B"/*/*/; do
     [ -d "$d/bin" ] && cp -a "$d"/bin/* "$ROOT/usr/local/bin/"
 done
 cp -a "$B"/uutils-coreutils/*/libexec/uu-coreutils "$ROOT/usr/local/libexec/"
+cp -a "$B"/git/*/libexec/git-core "$ROOT/usr/local/libexec/"
+mkdir -p "$ROOT/usr/local/share"
+cp -a "$B"/git/*/share/git-core "$ROOT/usr/local/share/"
 chmod -R u+w "$ROOT"
 
 # Point Homebrew's placeholders at the flattened layout.
@@ -69,6 +76,7 @@ fix() {
 for f in "$ROOT"/usr/local/lib/*.dylib; do [ -L "$f" ] || fix "$f" ""; done
 for f in "$ROOT"/usr/local/bin/*; do [ -L "$f" ] || fix "$f" "../lib/"; done
 for f in "$ROOT"/usr/local/libexec/uu-coreutils/*; do [ -L "$f" ] || fix "$f" ""; done
+for f in "$ROOT"/usr/local/libexec/git-core/*; do [ -L "$f" ] || fix "$f" "../../lib/"; done
 
 # The programs under their usual names.
 for u in $(ls "$B"/uutils-coreutils/*/libexec/uubin); do
@@ -81,7 +89,7 @@ ln -sf ../usr/local/bin/gsed "$ROOT/bin/sed"
 # GNU tar's child processes do long work after fork(), which guests cannot
 # do yet, so tar is bsdtar.
 for pair in gsed:sed ggrep:grep gegrep:egrep gfgrep:fgrep bsdtar:tar gtar:gtar bsdcat:bsdcat \
-            bsdunzip:unzip gfind:find gxargs:xargs gzip:gzip gunzip:gunzip zcat:zcat curl:curl; do
+            bsdunzip:unzip gfind:find gxargs:xargs gzip:gzip gunzip:gunzip zcat:zcat curl:curl git:git; do
     ln -sf "../local/bin/${pair%%:*}" "$ROOT/usr/bin/${pair##*:}"
 done
 

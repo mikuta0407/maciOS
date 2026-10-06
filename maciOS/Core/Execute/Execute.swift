@@ -405,6 +405,10 @@ class Execute: NSObject {
             "HOSTNAME": hostname,
             "TMPDIR": tmpDir,
             "PATH": pathEnv,
+            // git (in the guest root, see GuestRoot/build-root.sh) looks for
+            // its helpers and templates under Homebrew's usual prefix.
+            "GIT_EXEC_PATH": "/usr/local/libexec/git-core",
+            "GIT_TEMPLATE_DIR": "/usr/local/share/git-core/templates",
             "LANG": "en_US.UTF-8",
             "LC_CTYPE": "UTF-8",
             "TERM": "xterm-256color",
