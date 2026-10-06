@@ -62,6 +62,11 @@ class MachOPatcher: Equatable {
         self.fileURL = path
         self.patchedURL = URL.documentsDirectory.appendingPathComponent(fileURL.lastPathComponent + ".dylib")
     }
+
+    init(_ path: URL, output: URL) {
+        self.fileURL = path
+        self.patchedURL = output
+    }
     
     func patchExecutable() -> URL? {
         guard copyOriginalFile() else { return nil }

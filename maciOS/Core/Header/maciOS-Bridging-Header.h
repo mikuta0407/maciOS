@@ -6,6 +6,7 @@
 #import "../JIT/ellekit/fishhook/fishhook.h"
 #import "../Hooks/VirtualTTY.h"
 #import "../Hooks/GuestProcess.h"
+#import "../Hooks/GuestSpawn.h"
 #import "../MachO/CodeSignatureRehash.h"
 #import "../../../AppKit/AppKit/NSWindow.h"
 #import "../../../AppKit/AppKit/NSEvent.h"

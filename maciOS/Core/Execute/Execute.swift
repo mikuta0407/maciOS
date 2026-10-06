@@ -15,31 +15,112 @@ struct LCMain {
 
 class Execute: NSObject {
 
+    private static let setUp: Void = {
+        install_exit_hook()
+        guest_set_launcher { path, argv, envp, pid in
+            Execute.spawn(path: String(cString: path), argv: argv, envp: envp, pid: pid)
+        }
+        try? FileManager.default.removeItem(at: instanceDirectory)
+    }()
+
+    /// Patched copies of executables that guests start, keyed by the original's path, size and mtime.
+    private static let imageCacheDirectory = URL.cachesDirectory.appendingPathComponent("GuestImages")
+    /// One copy of a patched image per running program, so each gets its own globals.
+    private static let instanceDirectory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("GuestInstances")
+
     /// Patches a macOS executable into a loadable dylib and runs it on its own thread.
     @discardableResult
     static func launch(executable url: URL, arguments: [String] = []) -> MachOPatcher {
         let patcher = MachOPatcher(url)
-        install_exit_hook()
+        _ = setUp
         if let patched = patcher.patchExecutable() {
             run(dylibPath: patched.path, programName: url.lastPathComponent, arguments: arguments, executablePath: url.path)
         }
         return patcher
     }
 
-    static func run(dylibPath: String, programName: String? = nil, arguments: [String] = [], executablePath: String? = nil) {
+    /// Starts a program that a guest exec'd. Returns 0 once it is running, or an errno value.
+    private static func spawn(path: String, argv: UnsafePointer<UnsafeMutablePointer<CChar>?>, envp: UnsafePointer<UnsafeMutablePointer<CChar>?>, pid: pid_t) -> Int32 {
+        func strings(_ vector: UnsafePointer<UnsafeMutablePointer<CChar>?>) -> [String] {
+            var result: [String] = []
+            var cursor = vector
+            while let entry = cursor.pointee {
+                result.append(String(cString: entry))
+                cursor += 1
+            }
+            return result
+        }
+        let url = URL(fileURLWithPath: path)
+        let arguments = strings(argv)
+        guard let instance = instantiate(url, pid: pid) else { return ENOEXEC }
+        let started = run(dylibPath: instance.path, programName: arguments.first ?? url.lastPathComponent, arguments: Array(arguments.dropFirst()), executablePath: path, environment: strings(envp), pid: pid)
+        if !started {
+            try? FileManager.default.removeItem(at: instance)
+        }
+        return started ? 0 : ENOEXEC
+    }
+
+    private static func instantiate(_ url: URL, pid: pid_t) -> URL? {
+        let fileManager = FileManager.default
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else { return nil }
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        // FNV-1a, so the key is stable across launches.
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in url.path.utf8 {
+            hash = (hash ^ UInt64(byte)) &* 0x100000001b3
+        }
+        let key = "\(url.lastPathComponent)-\(String(hash, radix: 16))-\(size)-\(Int64(modified * 1000))"
+        let cached = imageCacheDirectory.appendingPathComponent(key + ".dylib")
+
+        try? fileManager.createDirectory(at: imageCacheDirectory, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: instanceDirectory, withIntermediateDirectories: true)
+
+        if !fileManager.fileExists(atPath: cached.path) {
+            let staging = imageCacheDirectory.appendingPathComponent(UUID().uuidString + ".dylib")
+            guard MachOPatcher(url, output: staging).patchExecutable() != nil else {
+                try? fileManager.removeItem(at: staging)
+                return nil
+            }
+            do {
+                try fileManager.moveItem(at: staging, to: cached)
+            } catch {
+                try? fileManager.removeItem(at: staging)
+                guard fileManager.fileExists(atPath: cached.path) else { return nil }
+            }
+        }
+
+        // A copy has its own inode, so dyld loads it as a new image instead of
+        // handing back one that is already running. On APFS this is a clone.
+        let instance = instanceDirectory.appendingPathComponent("\(url.lastPathComponent)-\(pid).dylib")
+        try? fileManager.removeItem(at: instance)
+        do {
+            try fileManager.copyItem(at: cached, to: instance)
+        } catch {
+            NSLog("Failed to copy %@: %@", cached.path, error.localizedDescription)
+            return nil
+        }
+        return instance
+    }
+
+    /// Loads a patched image and starts its entry point on a new thread.
+    /// `pid` is set for programs started by another guest, which run with
+    /// `environment` instead of the app's.
+    @discardableResult
+    static func run(dylibPath: String, programName: String? = nil, arguments: [String] = [], executablePath: String? = nil, environment: [String]? = nil, pid spawnedPid: pid_t? = nil) -> Bool {
         NSLog("Attempting to run dylib at path: %@", dylibPath)
-        
+
         guard FileManager.default.fileExists(atPath: dylibPath) else {
             NSLog("File does not exist at path: %@", dylibPath)
-            return
+            return false
         }
-        
+
         guard let handle = dlopen(dylibPath, RTLD_NOW | RTLD_GLOBAL) else {
             if let error = dlerror() {
                 let message = String(cString: error)
                 NSLog("Failed to load dylib: %@", message)
             }
-            return
+            return false
         }
         NSLog("Dylib loaded successfully.")
         
@@ -61,16 +142,32 @@ class Execute: NSObject {
             
             guard lcmain != nil else {
                 NSLog("No entry symbol found.")
-                return
+                return false
             }
         }
-        
-        // Set environment variables FIRST
-        let execute = Execute()
-        execute.setEnvironmentVariables()
-        
-        NSLog("Environment variables set.")
-        
+
+        let pid: pid_t
+        let guestEnvironment: [String]
+        if let spawnedPid, let environment {
+            pid = spawnedPid
+            guestEnvironment = environment
+        } else {
+            pid = guest_register_toplevel()
+            Execute().setEnvironmentVariables()
+            NSLog("Environment variables set.")
+            var current: [String] = []
+            var entry = environ
+            while let value = entry.pointee {
+                current.append(String(cString: value))
+                entry += 1
+            }
+            guestEnvironment = current
+        }
+        let toplevel = spawnedPid == nil
+        if !guest_attach_image(pid, dylibPath, handle, toplevel ? nil : dylibPath) {
+            NSLog("Failed to attach process hooks for %@", dylibPath)
+        }
+
         let progName = programName ?? (dylibPath as NSString).lastPathComponent
         var argv: [UnsafeMutablePointer<CChar>?] = [strdup(progName)]
         argv.append(contentsOf: arguments.map { strdup($0) })
@@ -83,11 +180,7 @@ class Execute: NSObject {
         // some runtimes, such as Go's, find the environment by walking past argv.
         let argc = Int32(argv.count - 1)
         var vector = argv
-        var environment = environ
-        while let entry = environment.pointee {
-            vector.append(strdup(entry))
-            environment += 1
-        }
+        vector.append(contentsOf: guestEnvironment.map { strdup($0) })
         vector.append(nil)
         vector.append(strdup("executable_path=\(executablePath ?? dylibPath)"))
         vector.append(nil)
@@ -100,26 +193,34 @@ class Execute: NSObject {
         
         
         let thread = Thread {
+            guest_adopt_current_thread(pid)
             NSLog("Executing dylib entry point...")
+            let status: Int32
             if let _ = lcmain {
-                _ = executeEntryPoint(for: dylibPath, argc, guestArgv)
+                status = executeEntryPoint(for: dylibPath, argc, guestArgv)
             } else {
                 typealias EntryFunc = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32
                 let entry = unsafeBitCast(entryPoint, to: EntryFunc.self)
-                _ = entry(argc, guestArgv)
+                status = entry(argc, guestArgv)
             }
-            
-            guest_restore_signal_handlers()
+
+            guest_entry_returned(pid, status)
+            if toplevel {
+                guest_restore_signal_handlers()
+            }
             NSLog("Dylib execution finished.")
         }
-        
+
         thread.name = "executable-thread-\(UUID().uuidString)"
         thread.qualityOfService = .userInteractive
         // Match the 8 MB main thread stack programs get on macOS.
         thread.stackSize = max(8 * 1024 * 1024, Int(lcmain?.stackSize ?? 0))
-        
-        guest_save_signal_handlers()
+
+        if toplevel {
+            guest_save_signal_handlers()
+        }
         thread.start()
+        return true
     }
     
     // NEW: Get TEXT segment base virtual address
