@@ -1,6 +1,6 @@
 # Builds an unsigned maciOS.ipa, guest root included, for sideloading.
-# A pushed v* tag publishes it as a GitHub release; a manual run keeps it
-# as a workflow artifact.
+# A pushed v* tag publishes it, with the StikDebug JIT script, as a GitHub
+# release; a manual run keeps them as workflow artifacts.
 name: Release
 
 on:
@@ -36,6 +36,11 @@ jobs:
           name: maciOS.ipa
           path: build/maciOS.ipa
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maciOS.js
+          path: stikdebug/maciOS.js
+
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -44,4 +49,4 @@ jobs:
         run: |
           prerelease=
           case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; esac
-          gh release create "$GITHUB_REF_NAME" build/maciOS.ipa --title "$GITHUB_REF_NAME" --generate-notes $prerelease
+          gh release create "$GITHUB_REF_NAME" build/maciOS.ipa stikdebug/maciOS.js --title "$GITHUB_REF_NAME" --generate-notes $prerelease

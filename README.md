@@ -23,6 +23,7 @@
 ## Getting started
 
 1. Install `maciOS.ipa` from the [releases](../../releases) with AltStore, SideStore or a similar tool, and enable JIT for it (StikDebug, SideStore, ...).
+   On iOS 26 devices with TXM, StikDebug needs `maciOS.js` from the same release: in LiveContainer, choose it under maciOS's settings > JIT launch script; in StikDebug, assign it to maciOS. Keep StikDebug running in the background while you use maciOS, since it prepares the memory of each program you run.
 2. Open maciOS. The Terminal window runs a bash login shell, with the usual command-line tools.
 3. The first shell installs [Homebrew](https://brew.sh) into `~/homebrew` (this needs a network connection and takes a minute). Then:
 
