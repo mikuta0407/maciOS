@@ -70,19 +70,23 @@ class MachOPatcher: Equatable {
     }
     
     func patchExecutable() -> URL? {
-        guard copyOriginalSlice() else { return nil }
+        func failed(_ step: String) -> URL? {
+            NSLog("Could not patch %@: %@ failed", fileURL.path, step)
+            return nil
+        }
+        guard copyOriginalSlice() else { return failed("copying the arm64 slice") }
         
-        guard convertToDylib() != nil else { return nil }
+        guard convertToDylib() != nil else { return failed("converting to a dylib") }
         
         #if targetEnvironment(simulator)
-        guard patchPlatform(targetPlatform: PLATFORM_IOSSIMULATOR) != nil else { return nil }
+        guard patchPlatform(targetPlatform: PLATFORM_IOSSIMULATOR) != nil else { return failed("patching the platform") }
         #else
-        guard patchPlatform(targetPlatform: PLATFORM_IOS) != nil else { return nil }
+        guard patchPlatform(targetPlatform: PLATFORM_IOS) != nil else { return failed("patching the platform") }
         #endif
         
         patchKnownFrameworks()
         
-        guard relinkLibraries(executablePath: fileURL.path) else { return nil }
+        guard relinkLibraries(executablePath: fileURL.path) else { return failed("relinking libraries") }
         
         finishPatching()
         

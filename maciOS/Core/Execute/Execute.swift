@@ -188,7 +188,10 @@ class Execute: NSObject {
     /// for dyld, so the run gets its own globals, as a process would.
     private static func instantiate(_ url: URL) -> URL? {
         let fileManager = FileManager.default
-        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else { return nil }
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else {
+            maciOS_trace_line("instantiate: cannot read \(url.path)")
+            return nil
+        }
         let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
         let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         // FNV-1a, so the key is stable across launches.
@@ -204,7 +207,9 @@ class Execute: NSObject {
 
         if !fileManager.fileExists(atPath: cached.path) {
             let staging = imageCacheDirectory.appendingPathComponent(UUID().uuidString + ".dylib")
+            maciOS_trace_line("instantiate: patching \(url.path)")
             guard MachOPatcher(url, output: staging).patchExecutable() != nil else {
+                maciOS_trace_line("instantiate: could not patch \(url.path)")
                 try? fileManager.removeItem(at: staging)
                 return nil
             }
@@ -212,7 +217,10 @@ class Execute: NSObject {
                 try fileManager.moveItem(at: staging, to: cached)
             } catch {
                 try? fileManager.removeItem(at: staging)
-                guard fileManager.fileExists(atPath: cached.path) else { return nil }
+                guard fileManager.fileExists(atPath: cached.path) else {
+                    maciOS_trace_line("instantiate: could not cache \(url.path): \(error)")
+                    return nil
+                }
             }
         }
 
@@ -229,7 +237,7 @@ class Execute: NSObject {
             try fileManager.copyItem(at: cached, to: instance)
             try GuestLibraries.cloneDependencies(of: instance)
         } catch {
-            NSLog("Failed to prepare %@: %@", url.path, error.localizedDescription)
+            NSLog("Failed to prepare %@: %@", url.path, String(describing: error))
             try? fileManager.removeItem(at: directory)
             return nil
         }

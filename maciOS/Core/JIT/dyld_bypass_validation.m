@@ -181,12 +181,26 @@ static bool txm;
 // hooks, where NSLog may take dyld's lock.
 static int traceFile = -1;
 
+extern void _NSSetLogCStringFunction(void (*)(const char *string, unsigned length, BOOL withSyslogBanner));
+
+// NSLog, which on a device otherwise only reaches the system log.
+static void log_cstring(const char *string, unsigned length, BOOL withSyslogBanner) {
+    maciOS_trace("%.*s", (int)length, string);
+    // With the usual banner, which the terminal recognizes as a host log.
+    char banner[128];
+    int bannerLength = snprintf(banner, sizeof(banner), "%s[%d:%llx] ", getprogname(), getpid(), (unsigned long long)pthread_mach_thread_np(pthread_self()));
+    write(STDERR_FILENO, banner, MIN((size_t)bannerLength, sizeof(banner) - 1));
+    write(STDERR_FILENO, string, length);
+    if (length == 0 || string[length - 1] != '\n') write(STDERR_FILENO, "\n", 1);
+}
+
 void maciOS_trace_start(void) {
     const char *home = getenv("HOME");
     if (!home) return;
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/Documents/maciOS-trace.log", home);
     traceFile = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    _NSSetLogCStringFunction(log_cstring);
 }
 
 void maciOS_trace(const char *format, ...) {
