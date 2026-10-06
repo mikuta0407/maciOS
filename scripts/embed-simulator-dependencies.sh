@@ -17,7 +17,7 @@ mkdir -p "${DST}"
 retarget() {
     bin="$1"
     if xcrun vtool -show-build "${bin}" 2>/dev/null | grep -q "platform IOS$"; then
-        xcrun vtool -set-build-version iossim 15.0 "${SDK_VERSION}" -replace -output "${bin}" "${bin}"
+        xcrun vtool -set-build-version iossim 26.0 "${SDK_VERSION}" -replace -output "${bin}" "${bin}"
     fi
     codesign --force --sign - --timestamp=none "${bin}"
 }

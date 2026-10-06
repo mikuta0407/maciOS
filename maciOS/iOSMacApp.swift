@@ -76,7 +76,9 @@ class CursorWindow: UIWindow {
     private let cursorView = UIImageView()
 
     private init() {
-        super.init(frame: UIScreen.main.bounds)
+        // Created from onAppear, by which point the app's window scene is connected.
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first!
+        super.init(windowScene: scene)
         windowLevel = .alert + 1   // ensures it's above alerts
         backgroundColor = .clear
         isHidden = false
@@ -150,8 +152,9 @@ struct NonRetinaScalingModifier: ViewModifier {
     func body(content: Content) -> some View {
         GeometryReader { geometry in
             let bounds = geometry.size
-            let native = UIScreen.main.nativeBounds.size
-            let nativeScale = UIScreen.main.nativeScale
+            let screen = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen }.first
+            let native = screen?.nativeBounds.size ?? bounds
+            let nativeScale = screen?.nativeScale ?? 1
             
             let targetWidthPoints = native.width / nativeScale
             let targetHeightPoints = native.height / nativeScale

@@ -131,11 +131,3 @@ extension FileImporterManager {
         importFiles(types: documentTypes, allowMultiple: allowMultiple, completion: completion)
     }
 }
-
-extension URL {
-    @available(iOS, introduced: 14.0, deprecated: 16.0, message: "Use URL.documentsDirectory on iOS 16 and above")
-    static var documentsDirectory: URL {
-        let documentDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return documentDirectory
-    }
-}

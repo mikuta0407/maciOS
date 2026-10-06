@@ -70,7 +70,7 @@ struct FloatingWindow<Content: View>: View {
                                         currentSize = geo.size
                                     }
                                 }
-                                .onChange(of: geo.size) { newSize in
+                                .onChange(of: geo.size) { _, newSize in
                                     let rect = CGRect(origin: .zero, size: newSize)
                                     windowSize = rect
                                     if currentSize.width == 0 && currentSize.height == 0 {
