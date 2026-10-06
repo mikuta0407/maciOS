@@ -10,8 +10,9 @@
 #   build            build and sign the Debug app (Xcode signs with the
 #                    account signed in under Settings > Accounts)
 #   install          install the built app
-#   launch           (re)launch the app and enable JIT
-#   jit [pid]        enable JIT for the running app: attach lldb and detach
+#   launch           (re)launch the app with JIT: lldb stays attached in the
+#                    background (scripts/maciOS_jit.py, log in jit.log)
+#   jit <pid>        attach the JIT helper to a running app
 #   run              build, install and launch
 #   type <text>      type text into the terminal (\n for Return)
 #   pull             fetch Documents/maciOS-trace.log and maciOS.log
@@ -60,7 +61,7 @@ build() {
     xcodebuild -project maciOS.xcodeproj -scheme maciOS -configuration Debug \
         -destination "id=$UDID" -derivedDataPath "$OUT/DerivedData" \
         -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
-        DEVELOPMENT_TEAM="$TEAM" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+        DEVELOPMENT_TEAM="$TEAM" MACIOS_BUNDLE_ID="$BUNDLE_ID" \
         build >"$OUT/build.log" 2>&1 || {
         grep -E "error:" "$OUT/build.log" | sort -u >&2
         die "build failed (see $OUT/build.log)"
@@ -73,19 +74,8 @@ install_app() {
     xcrun devicectl device install app --device "$DEVICE_ID" "$APP"
 }
 
-# The pid of the running app, or nothing.
-app_pid() {
-    xcrun devicectl device info processes --device "$DEVICE_ID" --quiet --json-output "$OUT/processes.json" >/dev/null
-    /usr/bin/python3 -I - "$OUT/processes.json" <<'EOF'
-import json, sys
-for p in json.load(open(sys.argv[1]))["result"]["runningProcesses"]:
-    if p.get("executable", "").endswith("/maciOS.app/maciOS"):
-        print(p["processIdentifier"])
-        break
-EOF
-}
-
 launch() {
+    # maciOS hooks dyld, then waits for the debugger before loading the shell.
     xcrun devicectl device process launch --device "$DEVICE_ID" --terminate-existing \
         --quiet --json-output "$OUT/launch.json" "$BUNDLE_ID" >/dev/null
     pid=$(/usr/bin/python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["result"]["process"]["processIdentifier"])' "$OUT/launch.json")
@@ -93,23 +83,22 @@ launch() {
     jit "$pid"
 }
 
-# Attaching a debugger marks the process CS_DEBUGGED, which is all JIT needs
-# without TXM; maciOS waits for it before loading the shell.
+# With TXM (all devices on iOS 27) a debugger has to stay attached to
+# prepare each executable mapping; see scripts/maciOS_jit.py. It resumes the
+# app and runs in the background until the app exits.
 jit() {
-    pid="${1:-$(app_pid)}"
-    [ -n "$pid" ] || die "maciOS is not running"
-    xcrun lldb --batch \
-        -o "device select $DEVICE_ID" \
-        -o "device process attach --pid $pid" \
-        -o "process detach" >"$OUT/lldb.log" 2>&1 || {
-        cat "$OUT/lldb.log" >&2
-        die "could not attach to pid $pid"
-    }
-    grep -q "Process $pid detached" "$OUT/lldb.log" || {
-        cat "$OUT/lldb.log" >&2
-        die "lldb did not attach to pid $pid"
-    }
-    echo "JIT enabled for pid $pid"
+    pid="${1:-}"
+    [ -n "$pid" ] || die "usage: jit <pid of maciOS>"
+    pkill -f "maciOS_jit.py" 2>/dev/null || true
+    nohup xcrun lldb --batch -o "command script import scripts/maciOS_jit.py" \
+        -o "maciOS_jit $DEVICE_ID $pid" >"$OUT/jit.log" 2>&1 &
+    for _ in $(seq 60); do
+        grep -q "attached to pid" "$OUT/jit.log" && { echo "JIT helper attached to pid $pid (log: $OUT/jit.log)"; return; }
+        kill -0 $! 2>/dev/null || break
+        sleep 1
+    done
+    cat "$OUT/jit.log" >&2
+    die "the JIT helper did not attach"
 }
 
 # The Debug app types whatever appears in Documents/.maciOS-input.

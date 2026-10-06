@@ -963,6 +963,21 @@ static char **copy_argv(char *const argv[], int skip, char *const prefix[], int 
     return result;
 }
 
+/// faccessat, except that X_OK is answered from the mode bits, as on macOS:
+/// a device's sandbox refuses X_OK for every file in the app's container, and
+/// guests are loaded into the app rather than executed by the kernel.
+static int guest_faccessat(int fd, const char *path, int mode, int flag) {
+    if (!(mode & X_OK)) return faccessat(fd, path, mode, flag);
+    if (faccessat(fd, path, (mode & ~X_OK) ?: F_OK, flag) != 0) return -1;
+    struct stat st;
+    if (fstatat(fd, path, &st, flag & AT_SYMLINK_NOFOLLOW) != 0) return -1;
+    if (!(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+
 /// Works out what running `path` means: a Mach-O file to load, or for a
 /// script, the interpreter its "#!" line names. On success `resolved` is the
 /// file to load and `*newArgv`, unless NULL, replaces `argv`. Returns an
@@ -983,7 +998,7 @@ static int resolve_exec(const char *path, char *const argv[], char resolved[PATH
         strlcpy(resolved, guest_root_map(current, buffer), PATH_MAX);
         struct stat st;
         if (stat(resolved, &st) != 0) return errno;
-        if (!S_ISREG(st.st_mode) || access(resolved, X_OK) != 0) return EACCES;
+        if (!S_ISREG(st.st_mode) || guest_faccessat(AT_FDCWD, resolved, X_OK, 0) != 0) return EACCES;
 
         int fd = open(resolved, O_RDONLY | O_CLOEXEC);
         if (fd < 0) return errno;
@@ -2486,12 +2501,12 @@ static int hook_fstatat(int fd, const char *path, struct stat *st, int flag) {
 
 static int hook_access(const char *path, int mode) {
     MAP_PATH(path);
-    return access(path, mode);
+    return guest_faccessat(AT_FDCWD, path, mode, 0);
 }
 
 static int hook_faccessat(int fd, const char *path, int mode, int flag) {
     MAP_PATH(path);
-    return faccessat(fd, path, mode, flag);
+    return guest_faccessat(fd, path, mode, flag);
 }
 
 static DIR *hook_opendir(const char *path) {
