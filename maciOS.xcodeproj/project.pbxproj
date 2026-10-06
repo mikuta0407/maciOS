@@ -177,6 +177,7 @@
 				4E2DEE252E5800CF0094C026 /* Resources */,
 				4E2C5E442E59E9450037BD64 /* Embed Frameworks */,
 				4E01E2752E6063F80018FDE6 /* Embed App Extensions */,
+				4EC1A0012F00000000000001 /* Embed Simulator Dependencies */,
 			);
 			buildRules = (
 			);
@@ -256,6 +257,28 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		4EC1A0012F00000000000001 /* Embed Simulator Dependencies */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Embed Simulator Dependencies";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${SRCROOT}/scripts/embed-simulator-dependencies.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		4E2DEE232E5800CF0094C026 /* Sources */ = {
@@ -399,10 +422,23 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 95J8WZ4TN8;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				EXCLUDED_SOURCE_FILE_NAMES = "";
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = (
+					"*.dylib",
+					Cocoa.framework,
+					CoreOpenGL.framework,
+					CoreWLAN.framework,
+					DisplayServices.framework,
+					IOBluetooth.framework,
+					MetalANGLE.framework,
+					OpenCL.framework,
+				);
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/maciOS/Core/Dependencies",
 				);
+				"FRAMEWORK_SEARCH_PATHS[sdk=iphonesimulator*]" = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = maciOS/Info.plist;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
@@ -420,6 +456,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/maciOS/Core/Dependencies",
 				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "";
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.stossy11.maciOS;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -444,10 +481,23 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 95J8WZ4TN8;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				EXCLUDED_SOURCE_FILE_NAMES = "";
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = (
+					"*.dylib",
+					Cocoa.framework,
+					CoreOpenGL.framework,
+					CoreWLAN.framework,
+					DisplayServices.framework,
+					IOBluetooth.framework,
+					MetalANGLE.framework,
+					OpenCL.framework,
+				);
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/maciOS/Core/Dependencies",
 				);
+				"FRAMEWORK_SEARCH_PATHS[sdk=iphonesimulator*]" = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = maciOS/Info.plist;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
@@ -465,6 +515,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/maciOS/Core/Dependencies",
 				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "";
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.stossy11.maciOS;
 				PRODUCT_NAME = "$(TARGET_NAME)";

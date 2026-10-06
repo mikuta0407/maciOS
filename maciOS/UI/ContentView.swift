@@ -38,8 +38,26 @@ struct ContentView: View {
         }
         .onAppear() {
             setupTerminal()
+            #if DEBUG
+            runExecutableFromLaunchArguments()
+            #endif
         }
     }
+    
+    #if DEBUG
+    /// `-maciOSRun <path> [args...]` runs an executable at launch, for testing without the file picker.
+    /// Relative paths are resolved against the Documents directory.
+    private func runExecutableFromLaunchArguments() {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-maciOSRun"), index + 1 < arguments.count else { return }
+        let path = arguments[index + 1]
+        let url = path.hasPrefix("/") ? URL(fileURLWithPath: path) : URL.documentsDirectory.appendingPathComponent(path)
+        let programArguments = Array(arguments[(index + 2)...])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            machO.append(Execute.launch(executable: url, arguments: programArguments))
+        }
+    }
+    #endif
     
     private func setupTerminal() {
         let view = createTerminalView()

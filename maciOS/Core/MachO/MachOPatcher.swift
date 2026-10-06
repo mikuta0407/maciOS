@@ -18,6 +18,7 @@ class MachOPatcher: Equatable {
     
     var fileURL: URL
     var patchedURL: URL
+    private var insufficientHeaderSpace = false
     var knownFrameworks: [(String, String)] {
        return [
             ("/usr/lib/libpcre.0.dylib", "@rpath/libpcre.1.dylib"),
@@ -74,6 +75,19 @@ class MachOPatcher: Equatable {
         #endif
         
         patchKnownFrameworks()
+        
+        #if targetEnvironment(simulator)
+        // The simulator has no JIT-based signature bypass, so make the existing
+        // ad-hoc signature match the patched contents instead.
+        if !macho_rehash_code_signature(patchedURL.path) {
+            NSLog("Failed to rehash code signature of %@", patchedURL.path)
+        }
+        // Rewrite into a fresh inode so no state the kernel attached to the
+        // file while it was being patched is reused when it is mapped.
+        if let data = try? Data(contentsOf: patchedURL) {
+            try? data.write(to: patchedURL, options: .atomic)
+        }
+        #endif
         
         return patchedURL
     }
@@ -137,6 +151,11 @@ class MachOPatcher: Equatable {
         
         if let error = error {
             NSLog("Error converting to dylib: \(error)")
+            return nil
+        }
+        
+        if insufficientHeaderSpace {
+            NSLog("Error converting to dylib: not enough free space after the load commands (relink with -Wl,-headerpad,0x1000)")
             return nil
         }
         
@@ -477,6 +496,11 @@ class MachOPatcher: Equatable {
         let nameLength = strlen(name) + 1
         let cmdSize = MemoryLayout<dylib_command>.size + Int(rnd32(UInt32(nameLength), 8))
         
+        guard cmdSize <= freeHeaderSpace(header) else {
+            insufficientHeaderSpace = true
+            return
+        }
+        
         let headerPtr = UnsafeMutableRawPointer(header)
         let dylibPtr = getDylibCommandPointer(cmd: cmd, header: header, cmdSize: cmdSize, headerPtr: headerPtr)
         
@@ -484,6 +508,34 @@ class MachOPatcher: Equatable {
         
         header.pointee.ncmds += 1
         header.pointee.sizeofcmds += UInt32(cmdSize)
+    }
+    
+    /// Bytes available between the end of the load commands and the first section's file contents.
+    private func freeHeaderSpace(_ header: UnsafeMutablePointer<mach_header_64>) -> Int {
+        let headerPtr = UnsafeMutableRawPointer(header)
+        let commandsEnd = MemoryLayout<mach_header_64>.size + Int(header.pointee.sizeofcmds)
+        var firstSectionOffset = Int.max
+        var command = headerPtr.advanced(by: MemoryLayout<mach_header_64>.size)
+        
+        for _ in 0..<header.pointee.ncmds {
+            let loadCommand = command.assumingMemoryBound(to: load_command.self)
+            if loadCommand.pointee.cmd == LC_SEGMENT_64 {
+                let segment = command.assumingMemoryBound(to: segment_command_64.self)
+                var section = command.advanced(by: MemoryLayout<segment_command_64>.size)
+                    .assumingMemoryBound(to: section_64.self)
+                for _ in 0..<segment.pointee.nsects {
+                    let type = section.pointee.flags & UInt32(SECTION_TYPE)
+                    let isZeroFill = type == S_ZEROFILL || type == S_GB_ZEROFILL || type == S_THREAD_LOCAL_ZEROFILL
+                    if section.pointee.offset != 0 && !isZeroFill {
+                        firstSectionOffset = min(firstSectionOffset, Int(section.pointee.offset))
+                    }
+                    section = section.advanced(by: 1)
+                }
+            }
+            command = command.advanced(by: Int(loadCommand.pointee.cmdsize))
+        }
+        
+        return firstSectionOffset == Int.max ? 0 : firstSectionOffset - commandsEnd
     }
     
     private func determineName(cmd: UInt32, path: UnsafePointer<CChar>) -> UnsafePointer<CChar> {

@@ -15,7 +15,18 @@ struct LCMain {
 
 class Execute: NSObject {
 
-    static func run(dylibPath: String) {
+    /// Patches a macOS executable into a loadable dylib and runs it on its own thread.
+    @discardableResult
+    static func launch(executable url: URL, arguments: [String] = []) -> MachOPatcher {
+        let patcher = MachOPatcher(url)
+        install_exit_hook()
+        if let patched = patcher.patchExecutable() {
+            run(dylibPath: patched.path, programName: url.lastPathComponent, arguments: arguments)
+        }
+        return patcher
+    }
+
+    static func run(dylibPath: String, programName: String? = nil, arguments: [String] = []) {
         NSLog("Attempting to run dylib at path: %@", dylibPath)
         
         guard FileManager.default.fileExists(atPath: dylibPath) else {
@@ -60,14 +71,9 @@ class Execute: NSObject {
         
         NSLog("Environment variables set.")
         
-        let progName = (dylibPath as NSString).lastPathComponent
+        let progName = programName ?? (dylibPath as NSString).lastPathComponent
         var argv: [UnsafeMutablePointer<CChar>?] = [strdup(progName)]
-        
-        // Add arguments if this is zsh
-        if progName.contains("zsh") || progName == "zsh" {
-            // Interactive login shell
-            // argv.append(strdup("-i"))
-        }
+        argv.append(contentsOf: arguments.map { strdup($0) })
         
         argv.append(nil)
         
@@ -81,8 +87,6 @@ class Execute: NSObject {
             } else {
                 typealias EntryFunc = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32
                 let entry = unsafeBitCast(entryPoint, to: EntryFunc.self)
-                
-                print(Thread.current.name ?? "")
                 _ = entry(argc, &argv)
                 
 

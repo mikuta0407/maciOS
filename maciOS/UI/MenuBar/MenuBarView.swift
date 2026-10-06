@@ -19,12 +19,7 @@ struct MenuBarView: View {
                     FileImporterManager.shared.importFiles(types: [.item]) { result in
                         switch result {
                         case .success(let urls):
-                            let patcher = MachOPatcher(urls.first!)
-                            machO.append(patcher)
-                            install_exit_hook()
-                            if let url = patcher.patchExecutable() {
-                                Execute.run(dylibPath: url.path)
-                            }
+                            machO.append(Execute.launch(executable: urls.first!))
                         case .failure(_):
                             break
                         }

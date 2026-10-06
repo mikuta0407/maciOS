@@ -39,7 +39,9 @@ struct maciOSApp: App {
                 }
                 .onAppear {
                     setenv("LC_HOME_PATH", getenv("HOME"), 1)
+                    #if !targetEnvironment(simulator)
                     init_bypassDyldLibValidation()
+                    #endif
                     
                     let binURL = URL.documentsDirectory.appendingPathComponent("bin")
                     try? FileManager.default.createDirectory(at: binURL, withIntermediateDirectories: false)
