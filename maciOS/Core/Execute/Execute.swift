@@ -75,16 +75,22 @@ class Execute: NSObject {
             return
         }
 
-        guard let entries = fileManager.enumerator(at: staging, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }
-        let base = staging.standardizedFileURL.path
-        for case let entry as URL in entries {
-            let relative = String(entry.standardizedFileURL.path.dropFirst(base.count + 1))
+        // A root that was never fully installed has nothing worth keeping
+        // (and may hold the leftovers of a failed install).
+        if (try? String(contentsOf: installedVersionURL, encoding: .utf8)) == nil {
+            try? fileManager.removeItem(at: rootDirectory)
+        }
+
+        // Paths relative to staging: its own path and the enumerated ones can
+        // differ in form on a device (/var vs /private/var).
+        guard let entries = fileManager.enumerator(atPath: staging.path) else { return }
+        while let relative = entries.nextObject() as? String {
+            let entry = staging.appendingPathComponent(relative)
             // Written last, so an interrupted install is redone.
             if relative == installedVersionURL.lastPathComponent { continue }
             let target = rootDirectory.appendingPathComponent(relative)
-            let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             do {
-                if values?.isDirectory == true && values?.isSymbolicLink != true {
+                if entries.fileAttributes?[.type] as? FileAttributeType == .typeDirectory {
                     try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
                 } else {
                     if (try? fileManager.attributesOfItem(atPath: target.path)) != nil {
