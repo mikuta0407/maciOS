@@ -38,6 +38,7 @@
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -1315,6 +1316,12 @@ static void hook_exit(int status) {
     guest_exit_with(CALLER, status);
 }
 
+void guest_end_calling_thread(int waitStatus) {
+    // Address 0 is in no image: the thread's own guest, if any, is used.
+    if (!child_ctx() && !guest_pid_at(0)) return;
+    guest_end(0, waitStatus);
+}
+
 static pid_t guest_wait(uintptr_t callerAddress, pid_t pid, int *status, int options, struct rusage *usage) {
     if (pid > 0 && pid < GUEST_PID_BASE) return wait4(pid, status, options, usage);
 
@@ -2400,7 +2407,26 @@ __attribute__((noreturn)) static void hook_verrc(int status, int code, const cha
 // Absolute paths under /bin, /usr and /etc go through the guest root.
 #define MAP_PATH(path) char path##_buffer[PATH_MAX]; path = guest_root_map(path, path##_buffer)
 
+/// N for "/dev/fd/N", else -1. A device's sandbox hides /dev/fd, which
+/// bash's process substitution (`<(...)`) hands to commands.
+static int dev_fd_number(const char *path) {
+    if (!path || strncmp(path, "/dev/fd/", 8) != 0) return -1;
+    char *end;
+    long number = strtol(path + 8, &end, 10);
+    return end == path + 8 || *end || number < 0 || number > INT_MAX ? -1 : (int)number;
+}
+
+/// Opening /dev/fd/N duplicates descriptor N, as on macOS.
+static int open_dev_fd(int number, int flags, uintptr_t caller) {
+    int fd = fcntl(map_fd(number, caller), (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
+    vfork_ctx *c = child_ctx();
+    return c ? child_adopt(c, fd, (flags & O_CLOEXEC) != 0) : fd;
+}
+
 static int hook_open(const char *path, int flags, ...) {
+    uintptr_t caller = CALLER;
+    int number = dev_fd_number(path);
+    if (number >= 0) return open_dev_fd(number, flags, caller);
     int mode = 0;
     if (flags & O_CREAT) {
         va_list args;
@@ -2415,6 +2441,9 @@ static int hook_open(const char *path, int flags, ...) {
 }
 
 static int hook_openat(int fd, const char *path, int flags, ...) {
+    uintptr_t caller = CALLER;
+    int number = dev_fd_number(path);
+    if (number >= 0) return open_dev_fd(number, flags, caller);
     int mode = 0;
     if (flags & O_CREAT) {
         va_list args;
@@ -2485,6 +2514,9 @@ static FILE *hook_fopen(const char *path, const char *mode) {
 }
 
 static int hook_stat(const char *path, struct stat *st) {
+    uintptr_t caller = CALLER;
+    int number = dev_fd_number(path);
+    if (number >= 0) return fstat(map_fd(number, caller), st);
     MAP_PATH(path);
     return stat(path, st);
 }
@@ -2513,6 +2545,30 @@ static DIR *hook_opendir(const char *path) {
     MAP_PATH(path);
     return opendir(path);
 }
+
+// The other calls that take paths, so a mapped directory (the temporary
+// ones, see GuestRoot.m) can be written to like any other.
+static int hook_mkdir(const char *path, mode_t mode) { MAP_PATH(path); return mkdir(path, mode); }
+static int hook_mkdirat(int fd, const char *path, mode_t mode) { MAP_PATH(path); return mkdirat(fd, path, mode); }
+static int hook_rmdir(const char *path) { MAP_PATH(path); return rmdir(path); }
+static int hook_unlink(const char *path) { MAP_PATH(path); return unlink(path); }
+static int hook_unlinkat(int fd, const char *path, int flag) { MAP_PATH(path); return unlinkat(fd, path, flag); }
+static int hook_rename(const char *from, const char *to) { MAP_PATH(from); MAP_PATH(to); return rename(from, to); }
+static int hook_renameat(int fromfd, const char *from, int tofd, const char *to) { MAP_PATH(from); MAP_PATH(to); return renameat(fromfd, from, tofd, to); }
+static int hook_symlink(const char *target, const char *path) { MAP_PATH(path); return symlink(target, path); }
+static int hook_symlinkat(const char *target, int fd, const char *path) { MAP_PATH(path); return symlinkat(target, fd, path); }
+static int hook_link(const char *from, const char *to) { MAP_PATH(from); MAP_PATH(to); return link(from, to); }
+static int hook_linkat(int fromfd, const char *from, int tofd, const char *to, int flag) { MAP_PATH(from); MAP_PATH(to); return linkat(fromfd, from, tofd, to, flag); }
+static int hook_chmod(const char *path, mode_t mode) { MAP_PATH(path); return chmod(path, mode); }
+static int hook_fchmodat(int fd, const char *path, mode_t mode, int flag) { MAP_PATH(path); return fchmodat(fd, path, mode, flag); }
+static int hook_chown(const char *path, uid_t uid, gid_t gid) { MAP_PATH(path); return chown(path, uid, gid); }
+static int hook_lchown(const char *path, uid_t uid, gid_t gid) { MAP_PATH(path); return lchown(path, uid, gid); }
+static int hook_truncate(const char *path, off_t length) { MAP_PATH(path); return truncate(path, length); }
+static int hook_utimes(const char *path, const struct timeval times[2]) { MAP_PATH(path); return utimes(path, times); }
+static int hook_lutimes(const char *path, const struct timeval times[2]) { MAP_PATH(path); return lutimes(path, times); }
+static int hook_utimensat(int fd, const char *path, const struct timespec times[2], int flag) { MAP_PATH(path); return utimensat(fd, path, times, flag); }
+static int hook_mkfifo(const char *path, mode_t mode) { MAP_PATH(path); return mkfifo(path, mode); }
+static int hook_statfs(const char *path, struct statfs *buffer) { MAP_PATH(path); return statfs(path, buffer); }
 
 static ssize_t hook_readlink(const char *path, char *buffer, size_t size) {
     MAP_PATH(path);
@@ -2761,6 +2817,8 @@ static struct rebinding guest_function_hooks[] = {
     { "mkstemps", (void *)hook_mkstemps, NULL },
     { "mkostemp", (void *)hook_mkostemp, NULL },
     { "fopen", (void *)hook_fopen, NULL },
+    // What code built with _DARWIN_C_SOURCE (libjq, say) calls.
+    { "fopen$DARWIN_EXTSN", (void *)hook_fopen, NULL },
     { "stat", (void *)hook_stat, NULL },
     { "lstat", (void *)hook_lstat, NULL },
     { "fstatat", (void *)hook_fstatat, NULL },
@@ -2768,6 +2826,27 @@ static struct rebinding guest_function_hooks[] = {
     { "faccessat", (void *)hook_faccessat, NULL },
     { "opendir", (void *)hook_opendir, NULL },
     { "readlink", (void *)hook_readlink, NULL },
+    { "mkdir", (void *)hook_mkdir, NULL },
+    { "mkdirat", (void *)hook_mkdirat, NULL },
+    { "rmdir", (void *)hook_rmdir, NULL },
+    { "unlink", (void *)hook_unlink, NULL },
+    { "unlinkat", (void *)hook_unlinkat, NULL },
+    { "rename", (void *)hook_rename, NULL },
+    { "renameat", (void *)hook_renameat, NULL },
+    { "symlink", (void *)hook_symlink, NULL },
+    { "symlinkat", (void *)hook_symlinkat, NULL },
+    { "link", (void *)hook_link, NULL },
+    { "linkat", (void *)hook_linkat, NULL },
+    { "chmod", (void *)hook_chmod, NULL },
+    { "fchmodat", (void *)hook_fchmodat, NULL },
+    { "chown", (void *)hook_chown, NULL },
+    { "lchown", (void *)hook_lchown, NULL },
+    { "truncate", (void *)hook_truncate, NULL },
+    { "utimes", (void *)hook_utimes, NULL },
+    { "lutimes", (void *)hook_lutimes, NULL },
+    { "utimensat", (void *)hook_utimensat, NULL },
+    { "mkfifo", (void *)hook_mkfifo, NULL },
+    { "statfs", (void *)hook_statfs, NULL },
     { "realpath$DARWIN_EXTSN", (void *)hook_realpath, NULL },
 };
 
@@ -2883,6 +2962,12 @@ static BOOL instance_directory(const char *path, char directory[PATH_MAX]) {
     return YES;
 }
 
+/// `path` without a leading "/private": on a device the container is
+/// /var/mobile/..., which dyld reports as /private/var/mobile/...
+static const char *without_private(const char *path) {
+    return strncmp(path, "/private/", 9) == 0 ? path + 8 : path;
+}
+
 /// Installs the hooks into the patched libraries programs have loaded (they
 /// live in the app's container, unlike the system's), each once. The ones
 /// cloned for `owner` are its own and are hooked as its image is; others are
@@ -2894,20 +2979,22 @@ static void guest_hook_libraries(guest_process *owner) {
     static char home[PATH_MAX];
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        strlcpy(home, NSHomeDirectory().fileSystemRepresentation, sizeof(home));
+        strlcpy(home, without_private(NSHomeDirectory().fileSystemRepresentation), sizeof(home));
         strlcat(home, "/", sizeof(home));
     });
     size_t homeLength = strlen(home);
 
     char ownDirectory[PATH_MAX] = "";
     os_unfair_lock_lock(&guest_lock);
-    if (owner && owner->used) instance_directory(owner->instancePath, ownDirectory);
+    if (owner && owner->used) instance_directory(without_private(owner->instancePath), ownDirectory);
     os_unfair_lock_unlock(&guest_lock);
     size_t ownLength = strlen(ownDirectory);
 
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (!name || strncmp(name, home, homeLength) != 0) continue;
+        const char *fullName = _dyld_get_image_name(i);
+        if (!fullName) continue;
+        const char *name = without_private(fullName);
+        if (strncmp(name, home, homeLength) != 0) continue;
         const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
         BOOL program = NO;
         os_unfair_lock_lock(&guest_lock);

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Spotlight finds nothing: there is no Xcode or other app to find here.
+exit 0

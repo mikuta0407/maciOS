@@ -107,9 +107,12 @@ jit() {
 # The Debug app types whatever appears in Documents/.maciOS-input.
 type_text() {
     printf '%b' "$1" >"$OUT/input"
+    # The app takes the file as soon as it lands, which devicectl then
+    # reports as a failure to find it: that is success.
     xcrun devicectl device copy to --device "$DEVICE_ID" --quiet \
         --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
-        --source "$OUT/input" --destination Documents/.maciOS-input
+        --source "$OUT/input" --destination Documents/.maciOS-input >"$OUT/type.log" 2>&1 ||
+        grep -q "Failed to retrieve the file node" "$OUT/type.log" || { cat "$OUT/type.log" >&2; return 1; }
 }
 
 stacks() {

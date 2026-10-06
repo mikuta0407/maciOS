@@ -1,0 +1,4 @@
+#!/bin/sh
+# No developer tools: Homebrew reads the version from `clang --version`
+# and, finding none, takes the Command Line Tools as not installed.
+exit 1

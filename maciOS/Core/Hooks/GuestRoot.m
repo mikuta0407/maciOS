@@ -11,10 +11,11 @@
 static char guest_root[PATH_MAX];
 static size_t guest_root_length;
 
-static const char *const mapped_prefixes[] = { "/bin", "/sbin", "/usr", "/etc", "/private/etc" };
+static const char *const mapped_prefixes[] = { "/bin", "/sbin", "/usr", "/etc", "/private/etc", "/Library/Developer" };
 // Directories of programs, which come only from the root: the system's own
-// cannot be run as guests, and in the simulator they are the Mac's.
-static const char *const opaque_prefixes[] = { "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec" };
+// cannot be run as guests, and in the simulator they are the Mac's (the
+// developer tools too: Homebrew runs their clang to see which are installed).
+static const char *const opaque_prefixes[] = { "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec", "/Library/Developer" };
 
 static BOOL has_prefix(const char *path, const char *prefix) {
     size_t length = strlen(prefix);
@@ -51,8 +52,31 @@ static const char *current_container_path(const char *path, char buffer[PATH_MAX
     return buffer;
 }
 
+// The system's temporary directories, which a device's sandbox does not let
+// the app use (Homebrew creates /private/tmp): all one directory in the app's
+// own, as /tmp is /private/tmp on macOS.
+static const char *const tmp_prefixes[] = { "/private/var/tmp", "/private/tmp", "/var/tmp", "/tmp" };
+
+static const char *guest_tmp_path(const char *path, char buffer[PATH_MAX]) {
+    static char tmp[PATH_MAX];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:@"guest-tmp"];
+        strlcpy(tmp, directory.fileSystemRepresentation, sizeof(tmp));
+        mkdir(tmp, 01777);
+    });
+    for (size_t i = 0; i < sizeof(tmp_prefixes) / sizeof(tmp_prefixes[0]); i++) {
+        if (!has_prefix(path, tmp_prefixes[i])) continue;
+        if (snprintf(buffer, PATH_MAX, "%s%s", tmp, path + strlen(tmp_prefixes[i])) >= PATH_MAX) return NULL;
+        return buffer;
+    }
+    return NULL;
+}
+
 const char *guest_root_map(const char *path, char buffer[PATH_MAX]) {
     if (!path || path[0] != '/') return path;
+    const char *temporary = guest_tmp_path(path, buffer);
+    if (temporary) return temporary;
     const char *moved = current_container_path(path, buffer);
     if (moved) return moved;
     if (guest_root_length == 0) return path;

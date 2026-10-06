@@ -264,8 +264,11 @@ static int common_hooked_fcntl(fcntl_p orig, int fildes, int cmd, void *param) {
         
         // Check if the file is our "in-memory" file
         if (__fcntl(fildes, F_GETPATH, filePath) != -1) {
+            // F_GETPATH gives /private/var/... for a home under /var.
             const char *homeDir = getenv("LC_HOME_PATH");
-            if (!strncmp(filePath, homeDir, strlen(homeDir))) {
+            const char *path = strncmp(filePath, "/private/", 9) == 0 ? filePath + 8 : filePath;
+            if (strncmp(homeDir, "/private/", 9) == 0) homeDir += 8;
+            if (!strncmp(path, homeDir, strlen(homeDir))) {
                 fsignatures_t *fsig = (fsignatures_t*)param;
                 // called to check that cert covers file.. so we'll make it cover everything ;)
                 fsig->fs_file_start = 0xFFFFFFFF;

@@ -20,6 +20,9 @@ func updateTerminalSize(rows: UInt16, cols: UInt16) {
 
 @_cdecl("my_exit")
 func my_exit(_ status: Int32) {
+    // A guest's exit() from a system library: end that program properly, so
+    // whoever waits for it hears about it.
+    guest_end_calling_thread((status & 0xff) << 8)
     guest_restore_signal_handlers()
     pthread_exit(nil)
 }
@@ -27,6 +30,7 @@ func my_exit(_ status: Int32) {
 @_cdecl("my_abort")
 func my_abort() {
     // abort() must not return; end the guest's thread instead of the whole app.
+    guest_end_calling_thread(SIGABRT)
     NSLog("abort was called — terminating the calling thread")
     pthread_exit(nil)
 }

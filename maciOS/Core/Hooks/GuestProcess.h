@@ -17,4 +17,10 @@ void guest_save_signal_handlers(void);
 /// Restores the dispositions recorded by guest_save_signal_handlers().
 void guest_restore_signal_handlers(void);
 
+/// Ends the guest that runs the calling thread with `waitStatus`, for exit()
+/// and abort() reached through the app's own hooks: from libraries that are
+/// not hooked per guest, such as the system's ncurses. Returns when the
+/// thread runs no guest.
+void guest_end_calling_thread(int waitStatus);
+
 NS_ASSUME_NONNULL_END
