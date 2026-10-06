@@ -30,6 +30,9 @@ class iOSTerminalDelegate: NSObject, TerminalViewDelegate, ObservableObject {
     func setTerminalView(_ terminalView: TerminalView) {
         self.terminalView = terminalView
         let terminal = terminalView.getTerminal()
+        // SwiftTerm prints parser diagnostics with print(), which would land on
+        // the guest's stdout pipe and be fed back into the terminal.
+        terminal.silentLog = true
         updateTerminalSize(rows: UInt16(terminal.rows), cols: UInt16(terminal.cols))
     }
     

@@ -56,6 +56,21 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
             machO.append(Execute.launch(executable: url, arguments: programArguments))
         }
+        startDebugInputFeed()
+    }
+    
+    /// Bytes written to Documents/.maciOS-input are typed into the terminal, so
+    /// interactive programs can be driven from the host while testing in the simulator.
+    private func startDebugInputFeed() {
+        let inputURL = URL.documentsDirectory.appendingPathComponent(".maciOS-input")
+        Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
+            guard let data = try? Data(contentsOf: inputURL), !data.isEmpty else { return }
+            try? Data().write(to: inputURL)
+            data.withUnsafeBytes { buffer in
+                guard let base = buffer.bindMemory(to: UInt8.self).baseAddress else { return }
+                vtty_receive_input(base, buffer.count)
+            }
+        }
     }
     #endif
     

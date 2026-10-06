@@ -21,12 +21,12 @@ class Execute: NSObject {
         let patcher = MachOPatcher(url)
         install_exit_hook()
         if let patched = patcher.patchExecutable() {
-            run(dylibPath: patched.path, programName: url.lastPathComponent, arguments: arguments)
+            run(dylibPath: patched.path, programName: url.lastPathComponent, arguments: arguments, executablePath: url.path)
         }
         return patcher
     }
 
-    static func run(dylibPath: String, programName: String? = nil, arguments: [String] = []) {
+    static func run(dylibPath: String, programName: String? = nil, arguments: [String] = [], executablePath: String? = nil) {
         NSLog("Attempting to run dylib at path: %@", dylibPath)
         
         guard FileManager.default.fileExists(atPath: dylibPath) else {
@@ -77,19 +77,25 @@ class Execute: NSObject {
         
         argv.append(nil)
         
+        // Programs that read their arguments via _NSGetArgv (e.g. Rust's std::env::args)
+        // would otherwise see the app's own arguments.
+        let argc = Int32(argv.count - 1)
+        let guestArgv = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: argv.count)
+        guestArgv.initialize(from: argv, count: argv.count)
+        if !guest_bind_process_info(dylibPath, argc, guestArgv, executablePath ?? dylibPath) {
+            NSLog("Failed to bind process info for %@", dylibPath)
+        }
+        
         
         
         let thread = Thread {
             NSLog("Executing dylib entry point...")
-            let argc = Int32(argv.count - 1)
             if let _ = lcmain {
                 _ = executeEntryPoint(for: dylibPath, argc, argv)
             } else {
                 typealias EntryFunc = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32
                 let entry = unsafeBitCast(entryPoint, to: EntryFunc.self)
-                _ = entry(argc, &argv)
-                
-
+                _ = entry(argc, guestArgv)
             }
             
             NSLog("Dylib execution finished.")
@@ -155,6 +161,9 @@ class Execute: NSObject {
         for (key, value) in env {
             setenv(key, value, 1) // overwrite existing
         }
+        
+        // Relative paths given to the program should resolve against $HOME, like a shell started there.
+        FileManager.default.changeCurrentDirectoryPath(documentsDir)
         
         NSLog("Environment variables set including PS1 and PROMPT")
     }
