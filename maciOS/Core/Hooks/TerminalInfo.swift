@@ -20,6 +20,7 @@ func updateTerminalSize(rows: UInt16, cols: UInt16) {
 
 @_cdecl("my_exit")
 func my_exit(_ status: Int32) {
+    guest_restore_signal_handlers()
     pthread_exit(nil)
 }
 

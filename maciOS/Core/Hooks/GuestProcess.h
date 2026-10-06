@@ -15,4 +15,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// (and be NULL-terminated) for as long as the guest runs.
 BOOL guest_bind_process_info(const char *imagePath, int argc, char * _Nullable * _Nonnull argv, const char *executablePath);
 
+/// Records the app's signal dispositions before a guest starts. Runtimes such
+/// as Go install process-wide handlers that must not outlive the program.
+void guest_save_signal_handlers(void);
+
+/// Restores the dispositions recorded by guest_save_signal_handlers().
+void guest_restore_signal_handlers(void);
+
 NS_ASSUME_NONNULL_END

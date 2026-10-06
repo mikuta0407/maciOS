@@ -79,9 +79,20 @@ class Execute: NSObject {
         
         // Programs that read their arguments via _NSGetArgv (e.g. Rust's std::env::args)
         // would otherwise see the app's own arguments.
+        // Lay argv out the way the kernel does (argv, NULL, envp, NULL, apple, NULL):
+        // some runtimes, such as Go's, find the environment by walking past argv.
         let argc = Int32(argv.count - 1)
-        let guestArgv = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: argv.count)
-        guestArgv.initialize(from: argv, count: argv.count)
+        var vector = argv
+        var environment = environ
+        while let entry = environment.pointee {
+            vector.append(strdup(entry))
+            environment += 1
+        }
+        vector.append(nil)
+        vector.append(strdup("executable_path=\(executablePath ?? dylibPath)"))
+        vector.append(nil)
+        let guestArgv = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: vector.count)
+        guestArgv.initialize(from: vector, count: vector.count)
         if !guest_bind_process_info(dylibPath, argc, guestArgv, executablePath ?? dylibPath) {
             NSLog("Failed to bind process info for %@", dylibPath)
         }
@@ -91,22 +102,23 @@ class Execute: NSObject {
         let thread = Thread {
             NSLog("Executing dylib entry point...")
             if let _ = lcmain {
-                _ = executeEntryPoint(for: dylibPath, argc, argv)
+                _ = executeEntryPoint(for: dylibPath, argc, guestArgv)
             } else {
                 typealias EntryFunc = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32
                 let entry = unsafeBitCast(entryPoint, to: EntryFunc.self)
                 _ = entry(argc, guestArgv)
             }
             
+            guest_restore_signal_handlers()
             NSLog("Dylib execution finished.")
         }
         
         thread.name = "executable-thread-\(UUID().uuidString)"
         thread.qualityOfService = .userInteractive
-        if let lcmain {
-            thread.stackSize = max(1024 * 1024, Int(lcmain.stackSize))
-        }
+        // Match the 8 MB main thread stack programs get on macOS.
+        thread.stackSize = max(8 * 1024 * 1024, Int(lcmain?.stackSize ?? 0))
         
+        guest_save_signal_handlers()
         thread.start()
     }
     
@@ -288,19 +300,19 @@ class Execute: NSObject {
         return nil
     }
 
-    static func executeEntryPoint(for dylibPath: String, _ argc: Int32, _ argv: [UnsafeMutablePointer<CChar>?]) -> Int32 {
+    static func executeEntryPoint(for dylibPath: String, _ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32 {
         guard let lcMain = getARM64EntryPoint(from: dylibPath) else {
-            print("LC_MAIN not found.")
+            NSLog("%@", "LC_MAIN not found.")
             return -1
         }
         
         guard let textVMAddr = getTextSegmentVMAddr(from: dylibPath) else {
-            print("Failed to get TEXT segment vmaddr.")
+            NSLog("%@", "Failed to get TEXT segment vmaddr.")
             return -1
         }
         
         guard let base = getMemoryBase(for: dylibPath) else {
-            print("Failed to retrieve in-memory base address.")
+            NSLog("%@", "Failed to retrieve in-memory base address.")
             return -1
         }
         
@@ -313,23 +325,18 @@ class Execute: NSObject {
         let entryPtr = UnsafeMutableRawPointer(bitPattern: Int(actualEntryAddr))
         
         guard let safeEntryPtr = entryPtr else {
-            print("Invalid entry point address calculated.")
+            NSLog("%@", "Invalid entry point address calculated.")
             return -1
         }
         
-        print("TEXT vmaddr: 0x\(String(textVMAddr, radix: 16))")
-        print("Entry offset: 0x\(String(lcMain.entryOffset, radix: 16))")
-        print("Base address: 0x\(String(baseAddr, radix: 16))")
-        print("Slide: 0x\(String(UInt64(bitPattern: slide), radix: 16))")
-        print("Final entry point: 0x\(String(UInt64(bitPattern: actualEntryAddr), radix: 16))")
-        
+        NSLog("%@", "TEXT vmaddr: 0x\(String(textVMAddr, radix: 16))")
+        NSLog("%@", "Entry offset: 0x\(String(lcMain.entryOffset, radix: 16))")
+        NSLog("%@", "Base address: 0x\(String(baseAddr, radix: 16))")
+        NSLog("%@", "Slide: 0x\(String(UInt64(bitPattern: slide), radix: 16))")
+        NSLog("%@", "Final entry point: 0x\(String(UInt64(bitPattern: actualEntryAddr), radix: 16))")
         typealias EntryFunc = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32
         let entryFunc = unsafeBitCast(safeEntryPtr, to: EntryFunc.self)
-        var argv = argv
-        
-        return argv.withUnsafeMutableBufferPointer { buffer in
-            entryFunc(argc, buffer.baseAddress)
-        }
+        return entryFunc(argc, argv)
     }
 
     // Keep your existing functions unchanged
@@ -365,9 +372,9 @@ class Execute: NSObject {
         let LC_MAIN: UInt32 = 0x80000028
         let LC_UNIXTHREAD: UInt32 = 0x5
         
-        print("Opening file: \(path)")
+        NSLog("%@", "Opening file: \(path)")
         guard let file = fopen(path, "rb") else {
-            print("Failed to open file")
+            NSLog("%@", "Failed to open file")
             return nil
         }
         defer { fclose(file) }
@@ -380,7 +387,7 @@ class Execute: NSObject {
         var sliceOffset: UInt32 = 0
         
         if magic == 0xcafebabe || magic == 0xbebafeca { // FAT_MAGIC / FAT_CIGAM
-            print("Universal binary detected")
+            NSLog("%@", "Universal binary detected")
             let needsSwap = magic == 0xbebafeca
             
             struct fat_header {
@@ -402,8 +409,7 @@ class Execute: NSObject {
                 fatHeader.nfat_arch = fatHeader.nfat_arch.byteSwapped
             }
             
-            print("Number of architectures: \(fatHeader.nfat_arch)")
-            
+            NSLog("%@", "Number of architectures: \(fatHeader.nfat_arch)")
             var found = false
             for i in 0..<fatHeader.nfat_arch {
                 var arch = fat_arch(cputype: 0, cpusubtype: 0, offset: 0, size: 0, align: 0)
@@ -414,20 +420,20 @@ class Execute: NSObject {
                     arch.offset = arch.offset.byteSwapped
                 }
                 
-                print("Arch \(i): cputype=0x\(String(arch.cputype, radix: 16)), offset=\(arch.offset)")
+                NSLog("%@", "Arch \(i): cputype=0x\(String(arch.cputype, radix: 16)), offset=\(arch.offset)")
                 if arch.cputype == CPU_ARM64 {
                     sliceOffset = arch.offset
                     found = true
-                    print("Selected ARM64 slice at offset \(sliceOffset)")
+                    NSLog("%@", "Selected ARM64 slice at offset \(sliceOffset)")
                     break
                 }
             }
             if !found {
-                print("ARM64 slice not found in universal binary")
+                NSLog("%@", "ARM64 slice not found in universal binary")
                 return nil
             }
         } else {
-            print("Single-arch binary detected")
+            NSLog("%@", "Single-arch binary detected")
         }
         
         // Seek to the Mach-O slice
@@ -449,15 +455,14 @@ class Execute: NSObject {
         fread(&header, MemoryLayout<mach_header_64>.size, 1, file)
         
         guard header.magic == 0xfeedfacf else {
-            print("Not a valid 64-bit Mach-O binary (magic: 0x\(String(header.magic, radix: 16)))")
+            NSLog("%@", "Not a valid 64-bit Mach-O binary (magic: 0x\(String(header.magic, radix: 16)))")
             return nil
         }
         
-        print("Mach-O header read: ncmds=\(header.ncmds), cputype=0x\(String(header.cputype, radix: 16))")
-        
+        NSLog("%@", "Mach-O header read: ncmds=\(header.ncmds), cputype=0x\(String(header.cputype, radix: 16))")
         // Verify this is actually ARM64
         if header.cputype != CPU_ARM64 {
-            print("Binary is not ARM64 (cputype: 0x\(String(header.cputype, radix: 16)))")
+            NSLog("%@", "Binary is not ARM64 (cputype: 0x\(String(header.cputype, radix: 16)))")
             return nil
         }
         
@@ -475,10 +480,9 @@ class Execute: NSObject {
             var cmd = load_command(cmd: 0, cmdsize: 0)
             fread(&cmd, MemoryLayout<load_command>.size, 1, file)
             
-            print("Load command \(i): cmd=0x\(String(cmd.cmd, radix: 16)), cmdsize=\(cmd.cmdsize)")
-            
+            NSLog("%@", "Load command \(i): cmd=0x\(String(cmd.cmd, radix: 16)), cmdsize=\(cmd.cmdsize)")
             if cmd.cmd == LC_MAIN {
-                print("Found LC_MAIN")
+                NSLog("%@", "Found LC_MAIN")
                 fseek(file, currentOffset, SEEK_SET)
                 
                 struct entry_point_command {
@@ -491,11 +495,11 @@ class Execute: NSObject {
                 var ep = entry_point_command(cmd: 0, cmdsize: 0, entryoff: 0, stacksize: 0)
                 fread(&ep, MemoryLayout<entry_point_command>.size, 1, file)
                 
-                print("LC_MAIN: entryOffset=0x\(String(ep.entryoff, radix: 16)), stackSize=0x\(String(ep.stacksize, radix: 16))")
+                NSLog("%@", "LC_MAIN: entryOffset=0x\(String(ep.entryoff, radix: 16)), stackSize=0x\(String(ep.stacksize, radix: 16))")
                 return LCMain(entryOffset: ep.entryoff, stackSize: ep.stacksize)
             }
             else if cmd.cmd == LC_UNIXTHREAD {
-                print("Found LC_UNIXTHREAD")
+                NSLog("%@", "Found LC_UNIXTHREAD")
                 fseek(file, currentOffset + MemoryLayout<load_command>.size, SEEK_SET)
                 
                 var flavor: UInt32 = 0
@@ -504,15 +508,14 @@ class Execute: NSObject {
                 fread(&count, MemoryLayout<UInt32>.size, 1, file)
                 
                 let ARM_THREAD_STATE64: UInt32 = 6
-                print("Thread flavor: \(flavor), count: \(count)")
-                
+                NSLog("%@", "Thread flavor: \(flavor), count: \(count)")
                 if flavor == ARM_THREAD_STATE64 {
-                    print("ARM_THREAD_STATE64 detected")
+                    NSLog("%@", "ARM_THREAD_STATE64 detected")
                     // Skip x0-x29 (30 registers), fp, lr, sp (3 more registers) = 33 * 8 bytes
                     fseek(file, 33 * 8, SEEK_CUR)
                     var pc: UInt64 = 0
                     fread(&pc, MemoryLayout<UInt64>.size, 1, file)
-                    print("LC_UNIXTHREAD: entryOffset=0x\(String(pc, radix: 16))")
+                    NSLog("%@", "LC_UNIXTHREAD: entryOffset=0x\(String(pc, radix: 16))")
                     return LCMain(entryOffset: pc, stackSize: 0)
                 }
             }
@@ -520,7 +523,7 @@ class Execute: NSObject {
             currentOffset += Int(cmd.cmdsize)
         }
         
-        print("No entry point found")
+        NSLog("%@", "No entry point found")
         return nil
     }
 
@@ -548,7 +551,7 @@ class Execute: NSObject {
             }
         }
         
-        print("No matching image found")
+        NSLog("%@", "No matching image found")
         return nil
     }
 
