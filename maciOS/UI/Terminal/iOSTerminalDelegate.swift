@@ -22,6 +22,9 @@ class iOSTerminalDelegate: NSObject, TerminalViewDelegate, ObservableObject {
     /// Documents/maciOS.log: stderr of this launch, host logs included, for
     /// reading in the Files app when something goes wrong on a device.
     private var logFile: Int32 = -1
+    /// Documents/maciOS-terminal.log: everything the terminal is fed, so the
+    /// screen can be read back without a screenshot (scripts/device.sh pull).
+    private var terminalLogFile: Int32 = -1
     
     var terminalView: TerminalView?
     
@@ -48,6 +51,7 @@ class iOSTerminalDelegate: NSObject, TerminalViewDelegate, ObservableObject {
         originalStdout = dup(STDOUT_FILENO)
         originalStderr = dup(STDERR_FILENO)
         logFile = open(URL.documentsDirectory.appendingPathComponent("maciOS.log").path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        terminalLogFile = open(URL.documentsDirectory.appendingPathComponent("maciOS-terminal.log").path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         
         setvbuf(stdout, nil, _IONBF, 0)
         setvbuf(stderr, nil, _IONBF, 0)
@@ -89,6 +93,7 @@ class iOSTerminalDelegate: NSObject, TerminalViewDelegate, ObservableObject {
     }
     
     private func feed(_ data: Data) {
+        mirror(data, to: terminalLogFile)
         let bytes = [UInt8](data)
         DispatchQueue.main.async { [weak self] in
             self?.terminalView?.feed(byteArray: bytes[...])

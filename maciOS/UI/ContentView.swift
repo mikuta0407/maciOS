@@ -102,11 +102,19 @@ struct ContentView: View {
     
     /// Bytes written to Documents/.maciOS-input are typed into the terminal, so
     /// interactive programs can be driven from the host while testing in the simulator.
+    private static var inputFeedStarted = false
+
     private func startDebugInputFeed() {
+        // onAppear can run more than once; two feeds would type everything twice.
+        guard !Self.inputFeedStarted else { return }
+        Self.inputFeedStarted = true
         let inputURL = URL.documentsDirectory.appendingPathComponent(".maciOS-input")
+        let takenURL = URL.documentsDirectory.appendingPathComponent(".maciOS-input.taken")
         Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
-            guard let data = try? Data(contentsOf: inputURL), !data.isEmpty else { return }
-            try? Data().write(to: inputURL)
+            // Taken by renaming, so a write that lands meanwhile is not lost or typed twice.
+            guard rename(inputURL.path, takenURL.path) == 0 else { return }
+            defer { unlink(takenURL.path) }
+            guard let data = try? Data(contentsOf: takenURL), !data.isEmpty else { return }
             data.withUnsafeBytes { buffer in
                 guard let base = buffer.bindMemory(to: UInt8.self).baseAddress else { return }
                 vtty_receive_input(base, buffer.count)

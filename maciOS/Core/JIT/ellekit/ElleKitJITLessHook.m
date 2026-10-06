@@ -14,6 +14,7 @@
 #include <mach/thread_state.h>
 #include <mach/thread_status.h>
 #include <pthread/pthread.h>
+#include <pthread/introspection.h>
 #include <stdlib.h>
 
 #include "fishhook/fishhook.h"
@@ -216,6 +217,24 @@ void EKAddHookToRegistry(void* target, void* replacement) {
     };
 }
 
+// The hooks' breakpoints are handled per thread: a thread's exception port is
+// asked before the task's, so a debugger (which takes the task's, as
+// StikDebug and lldb do when they attach) still gets every breakpoint that
+// is not a hook, such as maciOS's brk #0x69, when the handler fails it.
+static void EKClaimBreakpoints(thread_t thread) {
+    thread_set_exception_ports(thread, EXC_MASK_BREAKPOINT, server, EXCEPTION_STATE | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
+}
+
+static pthread_introspection_hook_t previousIntrospectionHook;
+
+static void EKThreadEvent(unsigned int event, pthread_t thread, void *addr, size_t size) {
+    // Runs on the new thread, before its start routine.
+    if (event == PTHREAD_INTROSPECTION_THREAD_START) {
+        EKClaimBreakpoints(pthread_mach_thread_np(thread));
+    }
+    if (previousIntrospectionHook) previousIntrospectionHook(event, thread, addr, size);
+}
+
 void EKLaunchExceptionHandler(void) {
     if (hookCount > 0) return;
     mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &server);
@@ -223,6 +242,7 @@ void EKLaunchExceptionHandler(void) {
     task_set_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, server, EXCEPTION_STATE | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
     pthread_t thread;
     pthread_create(&thread, NULL, exception_handler, NULL);
+    previousIntrospectionHook = pthread_introspection_hook_install(EKThreadEvent);
 
     // Don't let guest app interfere with this hardware breakpoint exception handler
     // FIXME: does it interfere with emulators' handler?
@@ -354,6 +374,7 @@ void EKJITLessHook(void* _target, void* _replacement, void** orig) {
         thread_t thread = act_list[i];
         
         thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&globalDebugState, ARM_DEBUG_STATE64_COUNT_);
+        EKClaimBreakpoints(thread);
         
         mach_port_deallocate(mach_task_self_, thread);
     }

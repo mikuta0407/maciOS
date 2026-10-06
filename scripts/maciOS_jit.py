@@ -1,7 +1,7 @@
 """Gives maciOS JIT from this Mac, like stikdebug/maciOS.js does on the device.
 
     xcrun lldb --batch -o "command script import scripts/maciOS_jit.py" \
-        -o "maciOS_jit <device-id> <pid>"
+        -o "maciOS_jit <device-id> <pid> [<dump-request-file>]"
 
 (Inside lldb itself: the device commands need the lldb binary.)
 
@@ -19,6 +19,7 @@ work, and this script redirects the hooks' hardware breakpoints itself, as
 ellekit's handler would, from maciOS's `hooks` table.
 """
 
+import os
 import time
 
 import lldb
@@ -115,14 +116,17 @@ def handle_stop(process):
 
 
 def maciOS_jit(debugger, arguments, result, internal_dict):
-    device, pid = arguments.split()
+    device, pid, *rest = arguments.split()
     try:
-        run(debugger, device, int(pid))
+        run(debugger, device, int(pid), rest[0] if rest else None)
     except Exception as error:
         log(f"error: {error}")
 
 
-def run(debugger, device, pid):
+def run(debugger, device, pid, dump_request):
+    """Runs until maciOS exits. When the app stops while the file
+    `dump_request` exists (device.sh stacks sends SIGSTOP), logs every
+    thread's backtrace and removes the file."""
     debugger.SetAsync(False)
     interpreter = debugger.GetCommandInterpreter()
     # Devices are discovered in the background after start-up.
@@ -148,6 +152,17 @@ def run(debugger, device, pid):
         raise RuntimeError(f"could not attach to pid {pid} ({state})")
     for signal in PASSED_SIGNALS:
         command(interpreter, f"process handle {signal} --stop false --pass true --notify false")
+    # lldb's own breakpoints (dyld's image notifier) are not needed here, and
+    # on top of the hooks' hardware breakpoints they leave the app stuck.
+    target = process.GetTarget()
+    log(command(interpreter, "breakpoint list --internal").strip())
+    for breakpoint_id in range(-1, -50, -1):
+        breakpoint = target.FindBreakpointByID(breakpoint_id)
+        if breakpoint.IsValid():
+            breakpoint.SetEnabled(False)
+            log(f"disabled lldb's breakpoint {breakpoint_id}: {breakpoint}")
+    # device.sh stacks stops the app with SIGSTOP to have the threads logged.
+    command(interpreter, "process handle SIGSTOP --stop true --pass false --notify false")
     # A brk that reaches the app as a signal is for us, not for the app.
     command(interpreter, "process handle SIGTRAP --stop true --pass false --notify true")
     log(f"attached to pid {pid}")
@@ -162,19 +177,38 @@ def run(debugger, device, pid):
             return
         if state == lldb.eStateCrashed:
             handle_stop(process)
+            dump_threads(process)
             log("maciOS crashed")
             return
-        if state == lldb.eStateStopped and not handle_stop(process):
-            # A trap of the app's own would only stop here again: it crashed.
-            for thread in process:
-                if thread.GetStopReason() not in (lldb.eStopReasonNone, lldb.eStopReasonInvalid) \
-                        and brk_immediate(process, thread.GetFrameAtIndex(0).GetPC()) is not None:
-                    log("maciOS trapped; killing it")
-                    for frame in thread:
-                        log(f"  {frame}")
-                    process.Kill()
-                    return
-            # Anything else (a bad access, say) goes on to the app.
+        if state != lldb.eStateStopped:
+            continue
+        if not handle_stop(process) and trapped(process):
+            return
+        if dump_request and os.path.exists(dump_request):
+            dump_threads(process)
+            os.remove(dump_request)
+
+
+def dump_threads(process):
+    for thread in process:
+        log(f"thread {thread.GetThreadID():#x} {thread.GetName() or ''} {thread.GetQueueName() or ''} "
+            f"stop={thread.GetStopDescription(128)!r} pc={thread.GetFrameAtIndex(0).GetPC():#x}")
+        for frame in list(thread)[:30]:
+            log(f"  {frame}")
+    log("end of threads")
+
+
+def trapped(process):
+    """A trap of the app's own would only stop here again: it crashed."""
+    for thread in process:
+        if thread.GetStopReason() not in (lldb.eStopReasonNone, lldb.eStopReasonInvalid) \
+                and brk_immediate(process, thread.GetFrameAtIndex(0).GetPC()) is not None:
+            log("maciOS trapped; killing it")
+            for frame in thread:
+                log(f"  {frame}")
+            process.Kill()
+            return True
+    return False
 
 
 def __lldb_init_module(debugger, internal_dict):
