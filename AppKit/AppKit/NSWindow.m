@@ -8,6 +8,18 @@
 #import "NSWindow.h"
 #import "NSImage.h"
 
+static UIScreen *NSWindowCurrentScreen(void) {
+    UIWindowScene *fallback = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            return ((UIWindowScene *)scene).screen;
+        }
+        fallback = fallback ?: (UIWindowScene *)scene;
+    }
+    return fallback.screen;
+}
+
 @implementation NSWindowBridgeViewController
 
 - (void)viewDidLoad {
@@ -1019,7 +1031,8 @@
                         [invocation setTarget:self.target];
                         [invocation setSelector:self.action];
                         if (signature.numberOfArguments > 2) {
-                            [invocation setArgument:&self atIndex:2];
+                            id sender = self;
+                            [invocation setArgument:&sender atIndex:2];
                         }
                         [invocation invoke];
                     }
@@ -1128,7 +1141,7 @@ NSString * const NSWindowDidCreateNotification = @"NSWindowDidCreateNotification
 - (void)makeKeyWindow {
 
     if ([self.delegate respondsToSelector:@selector(windowDidBecomeKey:)]) {
-
+        [self.delegate windowDidBecomeKey:[NSNotification notificationWithName:@"NSWindowDidBecomeKeyNotification" object:self]];
     }
 }
 
@@ -1167,7 +1180,7 @@ NSString * const NSWindowDidCreateNotification = @"NSWindowDidCreateNotification
 }
 
 - (void)setFrame:(CGRect)frame display:(BOOL)displayFlag animate:(BOOL)animateFlag {
-    _frame = [self constrainFrameRect:frame toScreen:[UIScreen mainScreen]];
+    _frame = [self constrainFrameRect:frame toScreen:NSWindowCurrentScreen()];
     self.contentView.frame = _frame;
     self.bridgeViewController.view.frame = _frame;
     if (displayFlag) {
@@ -1177,7 +1190,7 @@ NSString * const NSWindowDidCreateNotification = @"NSWindowDidCreateNotification
 }
 
 - (void)center {
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+    CGSize screenSize = NSWindowCurrentScreen().bounds.size;
     CGFloat x = (screenSize.width - self.frame.size.width) / 2;
     CGFloat y = (screenSize.height - self.frame.size.height) / 2;
     [self setFrame:CGRectMake(x, y, self.frame.size.width, self.frame.size.height) display:YES];

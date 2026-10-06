@@ -31,7 +31,7 @@ struct FloatingWindow<Content: View>: View {
         self.nsWindow = nsWindow
         
         if let nsWindow = nsWindow {
-            self._windowID = State(initialValue: WindowID(type: .nsWindow(windowID: nsWindow.identifier.uuidString ?? UUID().uuidString)))
+            self._windowID = State(initialValue: WindowID(type: .nsWindow(windowID: nsWindow.identifier.uuidString)))
         } else {
             self._windowID = State(initialValue: WindowID(type: .native(index: Int.random(in: 0...10000))))
         }
@@ -316,7 +316,7 @@ extension FloatingWindow where Content == UIViewWrapper<UIView> {
         self.uikit = true
         self.nsWindow = window
         self.nativeWindow = nil
-        self._windowID = State(initialValue: WindowID(type: .nsWindow(windowID: window.identifier.uuidString ?? UUID().uuidString)))
+        self._windowID = State(initialValue: WindowID(type: .nsWindow(windowID: window.identifier.uuidString)))
         
         window.titleDidChange = { [self] newTitle in
             DispatchQueue.main.async {
@@ -359,7 +359,7 @@ struct DraggableTitleBar: UIViewRepresentable {
                 WindowViewManager.shared.nativeFloatingWindow[firstIndex].shown = false
             }
             
-            print(nativeWindow)
+            print(String(describing: nativeWindow))
             
         }
         let greenCircle = createCircleView(color: .systemGreen, sfSymbolName: "arrow.up.left.and.arrow.down.right", coordinator: context.coordinator)

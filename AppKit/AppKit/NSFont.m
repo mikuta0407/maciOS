@@ -25,6 +25,8 @@ const NSFontWeight NSFontWeightBlack = 0.62;
 
 @implementation NSFont
 
+@dynamic fontName, familyName, pointSize, ascender, descender, leading, capHeight, xHeight, lineHeight;
+
 + (BOOL)supportsSecureCoding { return YES; }
 
 

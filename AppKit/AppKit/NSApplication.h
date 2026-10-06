@@ -1,5 +1,5 @@
 //
-//  NSapplication.h
+//  NSApplication.h
 //  AppKit-iOS
 //
 //  Created by Stossy11 on 30/08/2025.
@@ -17,7 +17,7 @@ typedef NSInteger NSModalResponse;
 
 NS_ASSUME_NONNULL_BEGIN
 
-int NSApplicationMain(int argc, const char * argv[]);
+int NSApplicationMain(int argc, const char * _Nonnull argv[_Nonnull]);
 
 @protocol NSApplicationDelegate <NSObject>
 @optional

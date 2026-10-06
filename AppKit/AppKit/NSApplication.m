@@ -6,9 +6,18 @@
 //
 
 #import <Foundation/Foundation.h>
-#import "NSapplication.h"
+#import "NSApplication.h"
 #import "NSAlert.h"
 #import "NSWindow.h"
+#import <pthread.h>
+
+@interface _NSApplicationThreadToken : NSObject
+@property (nonatomic, strong) NSApplication *app;
+@property (nonatomic, strong) NSValue *threadKey;
+@end
+
+@implementation _NSApplicationThreadToken
+@end
 
 @implementation NSApplication {
     NSThread *_owningThread;
@@ -16,11 +25,24 @@
 
 static NSMutableDictionary<NSValue*, NSApplication*> *_threadApplications = nil;
 static dispatch_once_t _threadApplicationsOnce;
+static pthread_key_t _threadExitKey;
+
+// Runs on the exiting thread when a thread that owns an NSApplication finishes.
+static void NSApplicationThreadDidExit(void *value) {
+    @autoreleasepool {
+        _NSApplicationThreadToken *token = (__bridge_transfer _NSApplicationThreadToken *)value;
+        @synchronized(_threadApplications) {
+            [token.app terminate:nil];
+            [_threadApplications removeObjectForKey:token.threadKey];
+        }
+    }
+}
 
 + (void)initialize {
     if (self == [NSApplication class]) {
         dispatch_once(&_threadApplicationsOnce, ^{
             _threadApplications = [[NSMutableDictionary alloc] init];
+            pthread_key_create(&_threadExitKey, NSApplicationThreadDidExit);
         });
     }
 }
@@ -32,22 +54,14 @@ static dispatch_once_t _threadApplicationsOnce;
     @synchronized(_threadApplications) {
         NSApplication *app = _threadApplications[threadKey];
         if (!app) {
-            NSString *threadName = currentThread.name ?: [NSString stringWithFormat:@"Thread-%p", currentThread];
             app = [[NSApplication alloc] init];
             app->_owningThread = currentThread;
             _threadApplications[threadKey] = app;
             
-            [[NSNotificationCenter defaultCenter] addObserverForName:NSThreadWillExitNotification
-                                                              object:currentThread
-                                                               queue:nil
-                                                          usingBlock:^(NSNotification *note) {
-                @synchronized(_threadApplications) {
-                    [app terminate:nil];
-                    [_threadApplications removeObjectForKey:threadKey];
-                }
-            }];
-            
-            NSString *logThreadName = currentThread.name ?: [NSString stringWithFormat:@"Thread-%p", currentThread];
+            _NSApplicationThreadToken *token = [[_NSApplicationThreadToken alloc] init];
+            token.app = app;
+            token.threadKey = threadKey;
+            pthread_setspecific(_threadExitKey, (__bridge_retained void *)token);
         }
         return app;
     }
@@ -59,7 +73,6 @@ static dispatch_once_t _threadApplicationsOnce;
         _owningThread = thread;
         _windows = [NSMutableArray array];
         _isRunning = NO;
-        NSString *threadName = thread.name ?: [NSString stringWithFormat:@"Thread-%p", thread];
     }
     return self;
 }
@@ -77,7 +90,6 @@ static dispatch_once_t _threadApplicationsOnce;
 }
 
 - (void)run {
-    NSString *threadName = _owningThread.name ?: [NSString stringWithFormat:@"Thread-%p", _owningThread];
     _isRunning = YES;
     
     if ([self.delegate respondsToSelector:@selector(applicationDidFinishLaunching:)]) {
@@ -117,17 +129,14 @@ static dispatch_once_t _threadApplicationsOnce;
         [window close];
     }
     
-    NSString *threadName = _owningThread.name ?: [NSString stringWithFormat:@"Thread-%p", _owningThread];
 }
 
 - (void)addWindow:(NSWindow*)window {
     [self.windows addObject:window];
-    NSString *threadName = _owningThread.name ?: [NSString stringWithFormat:@"Thread-%p", _owningThread];
 }
 
 - (void)removeWindow:(NSWindow*)window {
     [self.windows removeObject:window];
-    NSString *threadName = _owningThread.name ?: [NSString stringWithFormat:@"Thread-%p", _owningThread];
 }
 
 - (NSWindow*)keyWindow {
@@ -169,12 +178,9 @@ static dispatch_once_t _threadApplicationsOnce;
 @end
 
 // for when subproesses are implemented
-int NSApplicationMain(int argc, const char *argv[]) {
+int NSApplicationMain(int argc, const char * _Nonnull argv[_Nonnull]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
-        NSThread *currentThread = [NSThread currentThread];
-        NSString *threadName = currentThread.name ?: [NSString stringWithFormat:@"Thread-%p", currentThread];
-        
         char *envPath = getenv("maciOS_APP_BUNDLE_PATH");
         if (!envPath) {
             return -1;

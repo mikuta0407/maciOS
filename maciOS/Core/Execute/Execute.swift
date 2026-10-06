@@ -120,7 +120,7 @@ class Execute: NSObject {
         let xpcServiceName = "0"
         let cfBundleIdentifier = Bundle.main.bundleIdentifier ?? "com.stossy11.maciOS"
 
-        var env: [String: String] = [
+        let env: [String: String] = [
             "USER": userName,
             "LOGNAME": userName,
             "HOME": documentsDir,
@@ -188,7 +188,7 @@ class Execute: NSObject {
                 fatHeader.nfat_arch = fatHeader.nfat_arch.byteSwapped
             }
             
-            for i in 0..<fatHeader.nfat_arch {
+            for _ in 0..<fatHeader.nfat_arch {
                 var arch = fat_arch(cputype: 0, cpusubtype: 0, offset: 0, size: 0, align: 0)
                 fread(&arch, MemoryLayout<fat_arch>.size, 1, file)
                 

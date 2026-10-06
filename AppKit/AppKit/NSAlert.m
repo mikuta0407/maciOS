@@ -108,8 +108,17 @@
         }
     }
     
-    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
-    UIViewController *presentingVC = keyWindow.rootViewController ?: [UIApplication sharedApplication].keyWindow.rootViewController;
+    UIWindow *keyWindow = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        keyWindow = windowScene.keyWindow ?: windowScene.windows.firstObject;
+        if (scene.activationState == UISceneActivationStateForegroundActive) break;
+    }
+    UIViewController *presentingVC = keyWindow.rootViewController;
+    while (presentingVC.presentedViewController) {
+        presentingVC = presentingVC.presentedViewController;
+    }
     [presentingVC presentViewController:self.alertController animated:YES completion:nil];
 }
 

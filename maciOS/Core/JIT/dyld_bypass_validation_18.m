@@ -137,7 +137,7 @@ static int hooked___fcntl(int fildes, int cmd, void *param) {
     }
 }
 
-void init_bypassDyldLibValidation18() {
+void init_bypassDyldLibValidation18(void) {
     static BOOL bypassed;
     if (bypassed) return;
     bypassed = YES;

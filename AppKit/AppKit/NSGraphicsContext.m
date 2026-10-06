@@ -46,10 +46,10 @@ static NSGraphicsContext *_currentContext = nil;
     }
     
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGBitmapInfo bitmapInfo = kCGImageAlphaPremultipliedLast;
+    CGBitmapInfo bitmapInfo = (CGBitmapInfo)kCGImageAlphaPremultipliedLast;
     
     if (!bitmapRep.hasAlpha) {
-        bitmapInfo = kCGImageAlphaNone;
+        bitmapInfo = (CGBitmapInfo)kCGImageAlphaNone;
     }
     
     CGContextRef cgContext = CGBitmapContextCreate(
@@ -343,7 +343,7 @@ static NSGraphicsContext *_currentContext = nil;
         CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
         CGContextRef context = CGBitmapContextCreate(
             imageRep.bitmapData, width, height, bitsPerComponent, bytesPerRow,
-            colorSpace, kCGImageAlphaPremultipliedLast
+            colorSpace, (CGBitmapInfo)kCGImageAlphaPremultipliedLast
         );
         
         if (context) {
@@ -363,7 +363,7 @@ static NSGraphicsContext *_currentContext = nil;
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     CGContextRef context = CGBitmapContextCreate(
         _bitmapData, _pixelsWide, _pixelsHigh, _bitsPerSample, _bytesPerRow,
-        colorSpace, _hasAlpha ? kCGImageAlphaPremultipliedLast : kCGImageAlphaNone
+        colorSpace, (CGBitmapInfo)(_hasAlpha ? kCGImageAlphaPremultipliedLast : kCGImageAlphaNone)
     );
     
     CGColorSpaceRelease(colorSpace);

@@ -83,7 +83,7 @@ class WindowViewManager: ObservableObject {
             }
         } else {
             
-            print("noooo \(notification.userInfo), \(notification.userInfo?["nsWindow"] as? NSWindow)")
+            print("noooo \(String(describing: notification.userInfo)), \(String(describing: notification.userInfo?["nsWindow"] as? NSWindow))")
             
             
         }

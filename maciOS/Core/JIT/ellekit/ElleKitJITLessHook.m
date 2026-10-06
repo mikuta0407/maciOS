@@ -213,7 +213,7 @@ void EKAddHookToRegistry(void* target, void* replacement) {
     };
 }
 
-void EKLaunchExceptionHandler() {
+void EKLaunchExceptionHandler(void) {
     if (hookCount > 0) return;
     mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &server);
     mach_port_insert_right(mach_task_self(), server, server, MACH_MSG_TYPE_MAKE_SEND);

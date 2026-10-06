@@ -35,8 +35,8 @@ class StdioRunner: ObservableObject {
         }
         
         // Make reading non-blocking
-        var flags = fcntl(outputPipe[0], F_GETFL)
-        fcntl(outputPipe[0], F_SETFL, flags | O_NONBLOCK)
+        let flags = fcntl(outputPipe[0], F_GETFL)
+        _ = fcntl(outputPipe[0], F_SETFL, flags | O_NONBLOCK)
         
         // Redirect stdout and stderr to our output pipe
         dup2(outputPipe[1], STDOUT_FILENO)
@@ -50,7 +50,7 @@ class StdioRunner: ObservableObject {
     
     func sendInput(_ text: String) {
         let data = text.data(using: .utf8) ?? Data()
-        data.withUnsafeBytes { bytes in
+        _ = data.withUnsafeBytes { bytes in
             write(inputPipe[1], bytes.bindMemory(to: UInt8.self).baseAddress, data.count)
         }
     }

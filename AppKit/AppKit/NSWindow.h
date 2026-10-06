@@ -90,6 +90,7 @@ typedef NS_ENUM(NSInteger, NSWindowOrderingMode) {
 - (BOOL)windowShouldClose:(NSWindow*)sender;
 - (void)windowWillClose:(NSNotification*)notification;
 - (void)windowDidMiniaturize:(NSNotification*)notification;
+- (void)windowDidBecomeKey:(NSNotification*)notification;
 @end
 
 @interface NSWindowBridgeViewController : UIViewController

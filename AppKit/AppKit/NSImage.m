@@ -6,7 +6,7 @@
 //
 
 #import "NSImage.h"
-#import <CoreServices/CoreServices.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 @implementation NSImage {
     CGImageRef _cgImageBacking;
@@ -68,7 +68,7 @@
 - (NSData*)TIFFRepresentation {
     if (!_cgImageBacking) return nil;
     NSMutableData *data = [NSMutableData data];
-    CGImageDestinationRef dest = CGImageDestinationCreateWithData((CFMutableDataRef)data, kUTTypePNG, 1, NULL);
+    CGImageDestinationRef dest = CGImageDestinationCreateWithData((CFMutableDataRef)data, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL);
     if (!dest) return nil;
     CGImageDestinationAddImage(dest, _cgImageBacking, nil);
     if (!CGImageDestinationFinalize(dest)) {
@@ -87,7 +87,7 @@
     if (!_cgImageBacking) return nil;
 
     NSMutableData *data = [NSMutableData data];
-    CGImageDestinationRef dest = CGImageDestinationCreateWithData((CFMutableDataRef)data, kUTTypeJPEG, 1, NULL);
+    CGImageDestinationRef dest = CGImageDestinationCreateWithData((CFMutableDataRef)data, (__bridge CFStringRef)UTTypeJPEG.identifier, 1, NULL);
     if (!dest) return nil;
     NSDictionary *props = @{ (id)kCGImageDestinationLossyCompressionQuality : @(q) };
     CGImageDestinationAddImage(dest, _cgImageBacking, (CFDictionaryRef)props);

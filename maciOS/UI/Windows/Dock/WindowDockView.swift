@@ -100,10 +100,6 @@ struct WindowDockView: View {
     }
 
     func viewTypeName(_ window: (shown: Bool, window: AnyWindowRepresentable)) -> String {
-        // If it's AnyView, try to get the underlying type using Mirror
-        if window.window is AnyView {
-            return "AnyView \(UUID().uuidString)"
-        }
         if window.window.base is TerminalView {
             return "Terminal"
         } else {

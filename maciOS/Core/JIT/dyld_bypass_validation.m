@@ -222,7 +222,7 @@ static int hooked_dyld_fcntl(int fildes, int cmd, void *param) {
     return common_hooked_fcntl(__fcntl, fildes, cmd, param);
 }
 
-void init_bypassDyldLibValidation() {
+void init_bypassDyldLibValidation(void) {
     if (ios_major_version() < 19 || [[NSProcessInfo processInfo] isiOSAppOnMac]) {
         init_bypassDyldLibValidation18();
         return;

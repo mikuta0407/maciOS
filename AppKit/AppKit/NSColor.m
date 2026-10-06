@@ -52,92 +52,48 @@ MAKE(clear)
 #undef MAKE
 
 + (NSColor *)lightGrayColor;{
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
 }
 
 
 + (NSColor *)systemRedColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemRedColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor redColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemRedColor]];
 }
 
 + (NSColor *)systemGreenColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemGreenColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor greenColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemGreenColor]];
 }
 
 + (NSColor *)systemBlueColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemBlueColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor blueColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemBlueColor]];
 }
 
 + (NSColor *)systemYellowColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemYellowColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor yellowColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemYellowColor]];
 }
 
 + (NSColor *)systemOrangeColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemOrangeColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor orangeColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemOrangeColor]];
 }
 
 + (NSColor *)systemPinkColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemPinkColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor magentaColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemPinkColor]];
 }
 
 + (NSColor *)systemPurpleColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemPurpleColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor purpleColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemPurpleColor]];
 }
 
 + (NSColor *)systemTealColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemTealColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor cyanColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemTealColor]];
 }
 
 + (NSColor *)systemIndigoColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemIndigoColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor blueColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemIndigoColor]];
 }
 
 + (NSColor *)systemBrownColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemBrownColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor brownColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemBrownColor]];
 }
 
 + (NSColor *)systemMintColor {
@@ -161,147 +117,75 @@ MAKE(clear)
 }
 
 + (NSColor *)labelColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor labelColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor blackColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor labelColor]];
 }
 
 + (NSColor *)secondaryLabelColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor secondaryLabelColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor grayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor secondaryLabelColor]];
 }
 
 + (NSColor *)tertiaryLabelColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor tertiaryLabelColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor tertiaryLabelColor]];
 }
 
 + (NSColor *)quaternaryLabelColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor quaternaryLabelColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor quaternaryLabelColor]];
 }
 
 + (NSColor *)systemBackgroundColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemBackgroundColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor whiteColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemBackgroundColor]];
 }
 
 + (NSColor *)secondarySystemBackgroundColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor secondarySystemBackgroundColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor secondarySystemBackgroundColor]];
 }
 
 + (NSColor *)tertiarySystemBackgroundColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor tertiarySystemBackgroundColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor groupTableViewBackgroundColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor tertiarySystemBackgroundColor]];
 }
 
 + (NSColor *)systemGroupedBackgroundColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemGroupedBackgroundColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor groupTableViewBackgroundColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemGroupedBackgroundColor]];
 }
 
 + (NSColor *)secondarySystemGroupedBackgroundColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor secondarySystemGroupedBackgroundColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor whiteColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor secondarySystemGroupedBackgroundColor]];
 }
 
 + (NSColor *)tertiarySystemGroupedBackgroundColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor tertiarySystemGroupedBackgroundColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor groupTableViewBackgroundColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor tertiarySystemGroupedBackgroundColor]];
 }
 
 + (NSColor *)systemFillColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor systemFillColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor systemFillColor]];
 }
 
 + (NSColor *)secondarySystemFillColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor secondarySystemFillColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor secondarySystemFillColor]];
 }
 
 + (NSColor *)tertiarySystemFillColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor tertiarySystemFillColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor tertiarySystemFillColor]];
 }
 
 + (NSColor *)quaternarySystemFillColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor quaternarySystemFillColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor quaternarySystemFillColor]];
 }
 
 + (NSColor *)separatorColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor separatorColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor separatorColor]];
 }
 
 + (NSColor *)opaqueSeparatorColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor opaqueSeparatorColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor grayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor opaqueSeparatorColor]];
 }
 
 + (NSColor *)linkColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor linkColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor blueColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor linkColor]];
 }
 
 + (NSColor *)placeholderTextColor {
-    if (@available(iOS 13.0, *)) {
-        return [[self alloc] initWithUIColor:[UIColor placeholderTextColor]];
-    } else {
-        return [[self alloc] initWithUIColor:[UIColor lightGrayColor]];
-    }
+    return [[self alloc] initWithUIColor:[UIColor placeholderTextColor]];
 }
 
 + (NSColor *)controlAccentColor {
