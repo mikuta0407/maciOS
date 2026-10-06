@@ -1,0 +1,17 @@
+# Read by login shells in maciOS's terminal.
+
+export HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-$HOME/homebrew}"
+case ":$PATH:" in
+    *":$HOMEBREW_PREFIX/bin:"*) ;;
+    *) PATH="$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$PATH" ;;
+esac
+export PATH
+export SHELL=/bin/bash
+PS1='\u@\h:\w\$ '
+
+# The first shell installs Homebrew; this needs a network connection.
+if [ ! -x "$HOMEBREW_PREFIX/bin/brew" ] && [ ! -e "$HOME/.maciOS-no-homebrew" ]; then
+    install-homebrew ||
+        echo "Homebrew could not be installed; run install-homebrew to try again" \
+             "(touch ~/.maciOS-no-homebrew to stop trying at login)." >&2
+fi

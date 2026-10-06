@@ -20,21 +20,30 @@
 
 --- 
 
-## Guest root and Homebrew
+## Getting started
 
-Guest programs see a stand-in for `/bin`, `/usr` and `/etc`: `Documents/root`. It holds bash, uutils coreutils, curl, bsdtar, GNU sed/grep/findutils and a few small tools (`lockf`, `sysctl`, `getconf`, ...) that programs such as Homebrew expect from macOS.
-
-- `GuestRoot/build-root.sh` builds it from Homebrew bottles on your Mac (needs Homebrew).
-- The **Embed Guest Root** build phase runs it and puts the result in the app; the app installs it into `Documents/root` on launch whenever it is a different build. Without Homebrew on the Mac, the app is built without a guest root.
-
-Homebrew itself can then be installed from inside maciOS:
+1. Install `maciOS.ipa` from the [releases](../../releases) with AltStore, SideStore or a similar tool, and enable JIT for it (StikDebug, SideStore, ...).
+2. Open maciOS. The Terminal window runs a bash login shell, with the usual command-line tools.
+3. The first shell installs [Homebrew](https://brew.sh) into `~/homebrew` (this needs a network connection and takes a minute). Then:
 
 ```sh
-mkdir homebrew && curl -L https://github.com/Homebrew/brew/tarball/main | tar xz --strip-components 1 -C homebrew
-homebrew/bin/brew install msedit
+brew install msedit   # or jq, ...: formulae with bottles for macOS
+edit notes.txt
 ```
 
-`/etc/homebrew/brew.env` in the guest root sets `HOMEBREW_SPAWN_SYSTEM=1`: forked children share the parent's memory, so Homebrew must not run Ruby code in them.
+`~` is the app's Documents folder, which the Files app shows. Exiting the shell starts a new one. If the Homebrew install fails, run `install-homebrew` to try again.
+
+Limits: there is no compiler, so only formulae with bottles can be installed; Homebrew lives in `~/homebrew` rather than `/opt/homebrew`, so the few bottles that only work there cannot be used; and without git, `brew update` does not work (formulae come from Homebrew's API, so `brew install` and `brew upgrade` see new versions anyway).
+
+## Guest root
+
+Guest programs see a stand-in for `/bin`, `/usr` and `/etc`: `Documents/root`. It holds bash, uutils coreutils, curl, bsdtar, GNU sed/grep/findutils and a few small tools (`lockf`, `sysctl`, `getconf`, stubs of `xcode-select`, `codesign`, ...) that programs such as Homebrew expect from macOS, plus `/etc/profile` (which installs Homebrew) and `/etc/homebrew/brew.env`.
+
+- `GuestRoot/build-root.sh` builds it from Homebrew bottles on your Mac (needs Homebrew).
+- The **Embed Guest Root** build phase runs it and puts it in the app as `GuestRoot.aar`; the app installs it into `Documents/root` on launch whenever it is a different build. Without Homebrew on the Mac, the app is built without a guest root.
+- `scripts/build-ipa.sh` builds an unsigned `maciOS.ipa` with it. Pushing a `v*` tag runs the same in GitHub Actions and publishes a release.
+
+`brew.env` sets `HOMEBREW_SPAWN_SYSTEM=1` (forked children share the parent's memory, so Homebrew must not run Ruby code in them) and `HOMEBREW_NO_AUTO_UPDATE=1`.
 
 ---
 

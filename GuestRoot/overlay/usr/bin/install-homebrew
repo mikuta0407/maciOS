@@ -1,0 +1,29 @@
+#!/bin/bash
+# Installs Homebrew into $HOMEBREW_PREFIX (default ~/homebrew) from the
+# latest release, then lets it fetch its Ruby so the first command is quick.
+set -euo pipefail
+
+prefix="${HOMEBREW_PREFIX:-$HOME/homebrew}"
+if [ -x "$prefix/bin/brew" ]; then
+    echo "Homebrew is already installed in $prefix."
+    exit 0
+fi
+
+echo "==> Installing Homebrew into $prefix"
+latest=$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/Homebrew/brew/releases/latest)
+tag=${latest##*/}
+case "$tag" in
+    [0-9]*) url="https://github.com/Homebrew/brew/archive/refs/tags/$tag.tar.gz" ;;
+    *) tag=main; url="https://github.com/Homebrew/brew/tarball/main" ;;
+esac
+echo "==> Downloading Homebrew $tag"
+partial="$prefix.partial"
+rm -rf "$partial"
+mkdir -p "$partial"
+curl -fL --progress-bar "$url" | tar xz --strip-components 1 -C "$partial"
+mkdir -p "$partial/Caskroom"
+mv "$partial" "$prefix"
+
+echo "==> Setting up Homebrew's Ruby"
+"$prefix/bin/brew" config >/dev/null
+echo "==> Homebrew is ready. Try: brew install msedit"

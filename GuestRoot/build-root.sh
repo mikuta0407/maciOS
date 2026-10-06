@@ -8,8 +8,7 @@
 #
 # WORK (default: OUTPUT.work) keeps the extracted bottles between runs.
 # OUTPUT/.maciOS-root-version identifies what was built; when it is already
-# up to date, nothing is done. OUTPUT/.maciOS-root-executables lists the
-# files to make executable.
+# up to date, nothing is done.
 set -euo pipefail
 
 # Formulae whose programs make up the root. Their dependencies come along.
@@ -98,8 +97,6 @@ cc -dynamiclib -install_name "/$LDAP/LDAP" -o "$ROOT/$LDAP/LDAP" "$HERE/tools/ld
 
 cp -R "$HERE/overlay/" "$ROOT/"
 
-# Installing the app drops the files' modes, so the executable ones are listed.
-(cd "$ROOT" && find . -type f -perm -u+x | sed 's|^\./||' | sort) > "$ROOT/.maciOS-root-executables"
 echo "$VERSION" > "$ROOT/.maciOS-root-version"
 rm -rf "$OUT"
 mv "$ROOT" "$OUT"

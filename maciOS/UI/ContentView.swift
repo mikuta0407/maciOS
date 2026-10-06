@@ -39,9 +39,31 @@ struct ContentView: View {
         .onAppear() {
             setupTerminal()
             #if DEBUG
-            runExecutableFromLaunchArguments()
+            startDebugInputFeed()
+            if ProcessInfo.processInfo.arguments.contains("-maciOSRun") {
+                runExecutableFromLaunchArguments()
+                return
+            }
             #endif
+            startShell()
         }
+    }
+
+    /// Runs a login shell from the guest root in the terminal, like Terminal.app,
+    /// and a new one whenever it exits. The first one installs Homebrew (/etc/profile).
+    private func startShell() {
+        Execute.prepare()
+        let bash = Execute.rootDirectory.appendingPathComponent("bin/bash")
+        guard FileManager.default.fileExists(atPath: bash.path) else {
+            NSLog("No guest root at %@; not starting a shell", Execute.rootDirectory.path)
+            return
+        }
+        let started = Date()
+        machO.append(Execute.launch(executable: bash, arguments: ["-l"]) { _ in
+            // A shell that ends right away would only end again.
+            guard Date().timeIntervalSince(started) > 2 else { return }
+            startShell()
+        })
     }
     
     #if DEBUG
@@ -56,7 +78,6 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
             machO.append(Execute.launch(executable: url, arguments: programArguments))
         }
-        startDebugInputFeed()
     }
     
     /// Bytes written to Documents/.maciOS-input are typed into the terminal, so

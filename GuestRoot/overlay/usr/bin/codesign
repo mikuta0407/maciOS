@@ -1,0 +1,4 @@
+#!/bin/sh
+# maciOS re-signs (or bypasses signatures for) every image it loads, so
+# signing here has nothing to do: every request succeeds.
+exit 0

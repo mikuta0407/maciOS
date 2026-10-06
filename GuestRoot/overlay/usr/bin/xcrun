@@ -1,0 +1,4 @@
+#!/bin/sh
+# There are no developer tools to find.
+echo "xcrun: error: unable to find utility \"${2:-$1}\", not a developer tool or in PATH" >&2
+exit 72
