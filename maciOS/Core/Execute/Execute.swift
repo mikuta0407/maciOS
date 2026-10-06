@@ -20,13 +20,30 @@ class Execute: NSObject {
         guest_set_launcher { path, argv, envp, pid in
             Execute.spawn(path: String(cString: path), argv: argv, envp: envp, pid: pid)
         }
+        guest_set_library_loader { path, programImage, executablePath, loadable in
+            guard let result = GuestLibraries.loadable(String(cString: path), programImage: String(cString: programImage), executablePath: String(cString: executablePath)) else { return false }
+            strlcpy(loadable, result, Int(PATH_MAX))
+            return true
+        }
         try? FileManager.default.removeItem(at: instanceDirectory)
+        guest_root_set(rootDirectory.path)
+        // Patched images refer to each other by absolute path, which changes
+        // when the app's container moves.
+        let location = imageCacheDirectory.appendingPathComponent(".location")
+        if (try? String(contentsOf: location, encoding: .utf8)) != imageCacheDirectory.path {
+            try? FileManager.default.removeItem(at: imageCacheDirectory)
+            try? FileManager.default.createDirectory(at: imageCacheDirectory, withIntermediateDirectories: true)
+            try? imageCacheDirectory.path.write(to: location, atomically: true, encoding: .utf8)
+        }
     }()
 
+    /// Stands in for /bin, /usr and /etc; see GuestRoot.h.
+    static let rootDirectory = URL.documentsDirectory.appendingPathComponent("root")
+
     /// Patched copies of executables that guests start, keyed by the original's path, size and mtime.
-    private static let imageCacheDirectory = URL.cachesDirectory.appendingPathComponent("GuestImages")
+    static let imageCacheDirectory = URL.cachesDirectory.appendingPathComponent("GuestImages")
     /// One copy of a patched image per running program, so each gets its own globals.
-    private static let instanceDirectory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("GuestInstances")
+    static let instanceDirectory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("GuestInstances")
 
     /// Patches a macOS executable into a loadable dylib and runs it on its own thread.
     @discardableResult
@@ -186,9 +203,10 @@ class Execute: NSObject {
         vector.append(nil)
         let guestArgv = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: vector.count)
         guestArgv.initialize(from: vector, count: vector.count)
-        if !guest_bind_process_info(dylibPath, argc, guestArgv, executablePath ?? dylibPath) {
-            NSLog("Failed to bind process info for %@", dylibPath)
-        }
+        // main(argc, argv, envp, apple)
+        let guestEnvp = guestArgv + Int(argc) + 1
+        let guestApple = guestEnvp + guestEnvironment.count + 1
+        guest_set_process_info(pid, argc, guestArgv, guestEnvp, executablePath ?? dylibPath)
         
         
         
@@ -197,11 +215,11 @@ class Execute: NSObject {
             NSLog("Executing dylib entry point...")
             let status: Int32
             if let _ = lcmain {
-                status = executeEntryPoint(for: dylibPath, argc, guestArgv)
+                status = executeEntryPoint(for: dylibPath, argc, guestArgv, guestEnvp, guestApple)
             } else {
-                typealias EntryFunc = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32
+                typealias EntryFunc = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32
                 let entry = unsafeBitCast(entryPoint, to: EntryFunc.self)
-                status = entry(argc, guestArgv)
+                status = entry(argc, guestArgv, guestEnvp, guestApple)
             }
 
             guest_entry_returned(pid, status)
@@ -401,7 +419,7 @@ class Execute: NSObject {
         return nil
     }
 
-    static func executeEntryPoint(for dylibPath: String, _ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32 {
+    static func executeEntryPoint(for dylibPath: String, _ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>, _ envp: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>, _ apple: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32 {
         guard let lcMain = getARM64EntryPoint(from: dylibPath) else {
             NSLog("%@", "LC_MAIN not found.")
             return -1
@@ -435,9 +453,9 @@ class Execute: NSObject {
         NSLog("%@", "Base address: 0x\(String(baseAddr, radix: 16))")
         NSLog("%@", "Slide: 0x\(String(UInt64(bitPattern: slide), radix: 16))")
         NSLog("%@", "Final entry point: 0x\(String(UInt64(bitPattern: actualEntryAddr), radix: 16))")
-        typealias EntryFunc = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32
+        typealias EntryFunc = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32
         let entryFunc = unsafeBitCast(safeEntryPtr, to: EntryFunc.self)
-        return entryFunc(argc, argv)
+        return entryFunc(argc, argv, envp, apple)
     }
 
     // Keep your existing functions unchanged

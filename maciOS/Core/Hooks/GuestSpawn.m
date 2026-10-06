@@ -5,6 +5,8 @@
 
 #import "GuestSpawn.h"
 #import "GuestProcess.h"
+#import "GuestRoot.h"
+#import "GuestHeap.h"
 #import "../JIT/ellekit/fishhook/fishhook.h"
 
 #include <errno.h>
@@ -14,7 +16,16 @@
 #include <mach-o/dyld.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <crt_externs.h>
+#include <dirent.h>
 #include <dlfcn.h>
+#include <grp.h>
+#include <pwd.h>
+#include <err.h>
+#include <malloc/malloc.h>
+#include <spawn.h>
+#include <stdio.h>
 #include <os/lock.h>
 #include <sys/mman.h>
 #include <pthread.h>
@@ -57,6 +68,16 @@ typedef struct {
     int threadCount, threadCapacity;
     struct region { uintptr_t start, end; } *regions;  // memory it mapped
     int regionCount, regionCapacity;
+    const struct mach_header_64 *header;  // the program's image
+    intptr_t slide;
+    int argc;
+    char **argv;
+    char executablePath[PATH_MAX];
+    char **environ;         // what the program's environ and getenv() see
+    BOOL environOwned;      // environ was allocated by setenv() here
+    FILE *stdio[3];         // the program's stdin, stdout and stderr
+    guest_heap *heap;       // for programs that fork without threads; see GuestHeap.h
+    char cwd[PATH_MAX];     // its working directory; each of its threads has it as its own
 } guest_process;
 
 // Guest threads only hold this for short, syscall-free stretches; guest_teardown
@@ -69,11 +90,25 @@ static guest_process guests[GUEST_MAX];
 static pid_t guest_next_pid = GUEST_PID_BASE;
 static int guest_remapped_count;
 static guest_launcher_t guest_launcher;
+static guest_library_loader_t guest_library_loader;
+// The program a thread belongs to.
+static pthread_key_t guest_thread_key;
+
+// The working directory is per process, and guests share the app's process,
+// so each guest thread gets one of its own instead.
+int pthread_chdir_np(const char *path);
+int pthread_fchdir_np(int fd);
 
 static BOOL in_system_call(uintptr_t pc);
+static void guest_flush_stdio(pid_t pid);
+
+void guest_set_library_loader(guest_library_loader_t loader) {
+    guest_library_loader = loader;
+}
 
 void guest_set_launcher(guest_launcher_t launcher) {
     guest_launcher = launcher;
+    pthread_key_create(&guest_thread_key, NULL);
     // Resolve it now rather than during a teardown, under guest_lock.
     in_system_call(0);
 }
@@ -84,6 +119,10 @@ static guest_process *guest_alloc_locked(BOOL spawned) {
         if (g->used && !(g->exited && g->reaped)) continue;
         free(g->threads);
         free(g->regions);
+        if (g->environOwned) free(g->environ);
+        for (int fd = 0; fd < 3; fd++) {
+            if (g->stdio[fd]) fclose(g->stdio[fd]);
+        }
         memset(g, 0, sizeof(*g));
         g->used = YES;
         g->pid = guest_next_pid++;
@@ -304,11 +343,23 @@ static BOOL guest_teardown_locked(guest_process *g) {
 }
 
 pid_t guest_register_toplevel(void) {
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
     os_unfair_lock_lock(&guest_lock);
     guest_process *g = guest_alloc_locked(NO);
     pid_t pid = g ? g->pid : -1;
+    if (g) strlcpy(g->cwd, cwd, sizeof(g->cwd));
     os_unfair_lock_unlock(&guest_lock);
     return pid;
+}
+
+/// Gives the calling thread the program's working directory.
+static void guest_enter_cwd(guest_process *g) {
+    char cwd[PATH_MAX];
+    os_unfair_lock_lock(&guest_lock);
+    strlcpy(cwd, g->cwd, sizeof(cwd));
+    os_unfair_lock_unlock(&guest_lock);
+    if (cwd[0]) pthread_chdir_np(cwd);
 }
 
 void guest_adopt_current_thread(pid_t pid) {
@@ -316,9 +367,13 @@ void guest_adopt_current_thread(pid_t pid) {
     guest_process *g = guest_find_pid_locked(pid);
     if (g) guest_add_thread_locked(g, mach_thread_self());
     os_unfair_lock_unlock(&guest_lock);
+    pthread_setspecific(guest_thread_key, g);
+    if (g) guest_enter_cwd(g);
 }
 
 void guest_entry_returned(pid_t pid, int status) {
+    // As exit() would; the program's output may still be buffered.
+    guest_flush_stdio(pid);
     os_unfair_lock_lock(&guest_lock);
     guest_process *g = guest_find_pid_locked(pid);
     if (g) guest_mark_exited_locked(g, W_EXITCODE(status & 0xff, 0));
@@ -346,6 +401,14 @@ static BOOL guest_is_spawned(uintptr_t caller) {
     return spawned;
 }
 
+static pid_t guest_pid_at(uintptr_t caller) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    pid_t pid = g ? g->pid : 0;
+    os_unfair_lock_unlock(&guest_lock);
+    return pid;
+}
+
 __attribute__((noreturn))
 static void guest_exit_current(uintptr_t caller, int waitStatus) {
     os_unfair_lock_lock(&guest_lock);
@@ -354,12 +417,18 @@ static void guest_exit_current(uintptr_t caller, int waitStatus) {
     // Put the app's back before the handlers' memory goes away.
     if (!g || !g->spawned) guest_restore_signal_handlers();
     void *handle = NULL;
+    guest_heap *heap = NULL;
     if (g) {
         guest_mark_exited_locked(g, waitStatus);
-        if (guest_teardown_locked(g)) handle = g->handle;
+        if (guest_teardown_locked(g)) {
+            handle = g->handle;
+            heap = g->heap;
+            g->heap = NULL;
+        }
         g->handle = NULL;
     }
     os_unfair_lock_unlock(&guest_lock);
+    if (heap) guest_heap_destroy(heap);
     guest_notify_exit();
     // Nothing runs the program's code any more, apart from this thread, which
     // will not return into it.
@@ -386,7 +455,7 @@ typedef struct {
     void *copy;
 } stack_snapshot;
 
-typedef struct {
+typedef struct vfork_ctx {
     // Shared with GuestFork_arm64.s.
     uint64_t regs[12];          // x19..x28, x29, x30
     uint64_t sp;
@@ -396,8 +465,19 @@ typedef struct {
     BOOL active;
     pid_t pid;
     pid_t parentPid;
+    pid_t programPid;           // the program whose code the child runs
+    struct vfork_ctx *outer;    // the child this one was forked from, if any
     stack_snapshot snapshots[2];
-    char cwd[PATH_MAX];
+    // The program's globals, saved when nothing else in it runs while the
+    // child does. The child's changes to them are undone when it ends.
+    stack_snapshot *data;
+    int dataCount;
+    guest_heap *heap;           // and its heap, likewise
+    guest_heap_snapshot *heapSnapshot;
+    char **environ;             // the parent's, which the child may replace
+    sigset_t mask;
+    char cwd[PATH_MAX];         // the thread's working directory at the fork
+    BOOL changedCwd;
     void *resumeStack;
     child_fd fds[CHILD_MAX_FDS];
 } vfork_ctx;
@@ -409,24 +489,46 @@ _Static_assert(offsetof(vfork_ctx, resumeStackTop) == 168, "layout shared with G
 int guest_fork_hook(void);
 __attribute__((noreturn)) void guest_vfork_resume(vfork_ctx *ctx, pid_t pid);
 
+// A child can fork again (a shell's subshell running a pipeline), so each
+// thread has a stack of contexts; the innermost active one is the child
+// whose code the thread is running.
+#define VFORK_MAX_DEPTH 8
+
+typedef struct {
+    int depth;
+    vfork_ctx *contexts[VFORK_MAX_DEPTH];
+} vfork_thread;
+
 static pthread_key_t vfork_key;
 static BOOL vfork_key_ready;
 
-static void vfork_ctx_free(void *context) {
-    vfork_ctx *c = context;
-    free(c->resumeStack);
-    free(c);
+static void vfork_thread_free(void *value) {
+    vfork_thread *t = value;
+    for (int i = 0; i < VFORK_MAX_DEPTH; i++) {
+        if (!t->contexts[i]) continue;
+        free(t->contexts[i]->resumeStack);
+        free(t->contexts[i]);
+    }
+    free(t);
 }
 
-/// The calling thread's fork context, or NULL if it cannot fork right now.
+/// The context for a fork the calling thread is about to make, or NULL if
+/// it cannot fork right now.
 vfork_ctx *guest_vfork_context(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        vfork_key_ready = pthread_key_create(&vfork_key, vfork_ctx_free) == 0;
+        vfork_key_ready = pthread_key_create(&vfork_key, vfork_thread_free) == 0;
     });
     if (!vfork_key_ready) return NULL;
-    vfork_ctx *c = pthread_getspecific(vfork_key);
-    if (c) return c->active ? NULL : c;
+    vfork_thread *t = pthread_getspecific(vfork_key);
+    if (!t) {
+        t = calloc(1, sizeof(*t));
+        if (!t) return NULL;
+        pthread_setspecific(vfork_key, t);
+    }
+    if (t->depth == VFORK_MAX_DEPTH) return NULL;
+    vfork_ctx *c = t->contexts[t->depth];
+    if (c) return c;
     c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->resumeStack = malloc(RESUME_STACK_SIZE);
@@ -435,7 +537,7 @@ vfork_ctx *guest_vfork_context(void) {
         return NULL;
     }
     c->resumeStackTop = ((uintptr_t)c->resumeStack + RESUME_STACK_SIZE) & ~(uintptr_t)15;
-    pthread_setspecific(vfork_key, c);
+    t->contexts[t->depth] = c;
     return c;
 }
 
@@ -445,10 +547,10 @@ int guest_vfork_unavailable(void) {
 }
 
 /// The fork context of the calling thread while it runs a child's code.
-static vfork_ctx *child_ctx(void) {
+static inline vfork_ctx *child_ctx(void) {
     if (!vfork_key_ready) return NULL;
-    vfork_ctx *c = pthread_getspecific(vfork_key);
-    return (c && c->active) ? c : NULL;
+    vfork_thread *t = pthread_getspecific(vfork_key);
+    return (t && t->depth > 0) ? t->contexts[t->depth - 1] : NULL;
 }
 
 static BOOL read_word(uintptr_t address, uintptr_t *out) {
@@ -474,6 +576,15 @@ static void free_snapshots(vfork_ctx *c) {
         c->snapshots[i].copy = NULL;
         c->snapshots[i].length = 0;
     }
+    for (int i = 0; i < c->dataCount; i++) {
+        free(c->data[i].copy);
+    }
+    free(c->data);
+    c->data = NULL;
+    c->dataCount = 0;
+    if (c->heapSnapshot) guest_heap_discard(c->heapSnapshot);
+    c->heapSnapshot = NULL;
+    c->heap = NULL;
 }
 
 /// Saves the stack memory the child's code will overwrite before the parent
@@ -497,14 +608,44 @@ static BOOL snapshot_stacks(vfork_ctx *c) {
         return take_snapshot(&c->snapshots[0], sp, g0sp) && take_snapshot(&c->snapshots[1], gsp, gend);
     }
 
-    uintptr_t end = sp + 64 * 1024 < stackTop ? sp + 64 * 1024 : stackTop;
+    // Otherwise save all of the stack in use: a shell's child returns
+    // through some of the frames above the fork before it ends.
     c->snapshots[1] = (stack_snapshot){ 0 };
-    return take_snapshot(&c->snapshots[0], sp, end);
+    return take_snapshot(&c->snapshots[0], sp, stackTop);
+}
+
+/// Saves the writable data segments of a program's image.
+static BOOL snapshot_data(vfork_ctx *c, const struct mach_header_64 *header, intptr_t slide) {
+    const uint8_t *cursor = (const uint8_t *)(header + 1);
+    int count = 0;
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, "__DATA") == 0 || strcmp(seg->segname, "__DATA_DIRTY") == 0) count++;
+        }
+        cursor += lc->cmdsize;
+    }
+    if (count == 0) return YES;
+    c->data = calloc((size_t)count, sizeof(*c->data));
+    if (!c->data) return NO;
+    cursor = (const uint8_t *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        cursor += lc->cmdsize;
+        if (lc->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+        if (strcmp(seg->segname, "__DATA") != 0 && strcmp(seg->segname, "__DATA_DIRTY") != 0) continue;
+        uintptr_t start = (uintptr_t)(seg->vmaddr + slide);
+        if (!take_snapshot(&c->data[c->dataCount++], start, start + (uintptr_t)seg->vmsize)) return NO;
+    }
+    return YES;
 }
 
 /// Called from guest_fork_hook with the caller's registers saved. Returns 0
 /// to run the child's code on this thread.
 int guest_vfork_begin(vfork_ctx *c) {
+    vfork_ctx *outer = child_ctx();
     if (!snapshot_stacks(c)) {
         free_snapshots(c);
         errno = ENOMEM;
@@ -512,23 +653,51 @@ int guest_vfork_begin(vfork_ctx *c) {
     }
 
     os_unfair_lock_lock(&guest_lock);
-    guest_process *parent = guest_find_address_locked((uintptr_t)c->regs[11]);
+    guest_process *program = guest_find_address_locked((uintptr_t)c->regs[11]);
+    pid_t parentPid = outer ? outer->pid : (program ? program->pid : 0);
     guest_process *child = guest_alloc_locked(YES);
-    if (child) child->ppid = parent ? parent->pid : 0;
+    if (child) child->ppid = parentPid;
+    // With no other thread running the program's code, the child is the only
+    // one changing its globals, so they can be put back afterwards. A shell
+    // relies on that: its subshells run its own code, not another program.
+    BOOL alone = program && program->threadCount <= 1;
+    const struct mach_header_64 *header = alone ? program->header : NULL;
+    intptr_t slide = program ? program->slide : 0;
+    guest_heap *heap = alone ? program->heap : NULL;
+    c->environ = program ? program->environ : NULL;
+    pid_t programPid = program ? program->pid : 0;
     os_unfair_lock_unlock(&guest_lock);
     if (!child) {
         free_snapshots(c);
         errno = EAGAIN;
         return -1;
     }
+    if (heap) {
+        c->heap = heap;
+        c->heapSnapshot = guest_heap_save(heap);
+    }
+    if ((header && !snapshot_data(c, header, slide)) || (heap && !c->heapSnapshot)) {
+        free_snapshots(c);
+        os_unfair_lock_lock(&guest_lock);
+        child->exited = child->reaped = YES;
+        os_unfair_lock_unlock(&guest_lock);
+        errno = ENOMEM;
+        return -1;
+    }
 
     c->pid = child->pid;
-    c->parentPid = parent ? parent->pid : 0;
-    c->cwd[0] = '\0';
+    c->parentPid = parentPid;
+    c->programPid = programPid;
+    c->outer = outer;
+    if (!getcwd(c->cwd, sizeof(c->cwd))) c->cwd[0] = '\0';
+    c->changedCwd = NO;
+    pthread_sigmask(SIG_SETMASK, NULL, &c->mask);
     for (int i = 0; i < CHILD_MAX_FDS; i++) {
         c->fds[i] = (child_fd){ CHILD_FD_INHERITED, -1, -1 };
     }
     c->active = YES;
+    vfork_thread *t = pthread_getspecific(vfork_key);
+    t->depth++;
     return 0;
 }
 
@@ -538,6 +707,17 @@ void guest_vfork_restore_stacks(vfork_ctx *c) {
         stack_snapshot *s = &c->snapshots[i];
         if (s->copy) memcpy((void *)s->address, s->copy, s->length);
     }
+    for (int i = 0; i < c->dataCount; i++) {
+        stack_snapshot *s = &c->data[i];
+        if (s->copy) memcpy((void *)s->address, s->copy, s->length);
+    }
+    if (c->heapSnapshot) {
+        guest_heap_restore(c->heap, c->heapSnapshot);
+        c->heapSnapshot = NULL;
+    }
+    pthread_sigmask(SIG_SETMASK, &c->mask, NULL);
+    // The child's chdir() changed this thread's directory, which is the parent's.
+    if (c->changedCwd && c->cwd[0]) pthread_chdir_np(c->cwd);
     free_snapshots(c);
 }
 
@@ -553,7 +733,14 @@ static void child_finish(vfork_ctx *c) {
     for (int i = 0; i < CHILD_MAX_FDS; i++) {
         if (c->fds[i].state == CHILD_FD_OWNED) child_release(c, i);
     }
+    os_unfair_lock_lock(&guest_lock);
+    // The child may have replaced the environment, as Rust does before exec.
+    guest_process *program = guest_find_address_locked((uintptr_t)c->regs[11]);
+    if (program) program->environ = c->environ;
+    os_unfair_lock_unlock(&guest_lock);
     c->active = NO;
+    vfork_thread *t = pthread_getspecific(vfork_key);
+    t->depth--;
     guest_vfork_resume(c, c->pid);
 }
 
@@ -564,6 +751,7 @@ static int child_resolve(vfork_ctx *c, int fd) {
     child_fd *e = &c->fds[fd];
     if (e->state == CHILD_FD_CLOSED) return -1;
     if (e->state == CHILD_FD_OWNED) return e->real;
+    if (c->outer) return child_resolve(c->outer, fd);
     if (fd <= 2 && c->parentPid) {
         os_unfair_lock_lock(&guest_lock);
         guest_process *parent = guest_find_pid_locked(c->parentPid);
@@ -583,7 +771,9 @@ static BOOL child_is_open(vfork_ctx *c, int fd) {
 static BOOL child_is_cloexec(vfork_ctx *c, int fd) {
     child_fd *e = &c->fds[fd];
     if (e->cloexec >= 0) return e->cloexec;
-    if (e->state != CHILD_FD_INHERITED || fd <= 2) return NO;
+    if (e->state != CHILD_FD_INHERITED) return NO;
+    if (c->outer) return child_is_cloexec(c->outer, fd);
+    if (fd <= 2) return NO;
     int flags = fcntl(child_resolve(c, fd), F_GETFD);
     return flags >= 0 && (flags & FD_CLOEXEC);
 }
@@ -607,6 +797,25 @@ static int child_lowest_free(vfork_ctx *c, int from) {
     }
     errno = EMFILE;
     return -1;
+}
+
+/// Makes a descriptor the child just created its own, so that it closes
+/// with the child. Returns the number the child knows it by.
+static int child_adopt(vfork_ctx *c, int real, BOOL cloexec) {
+    if (real < 0 || real >= CHILD_MAX_FDS) return real;
+    int fd = real;
+    child_fd *e = &c->fds[real];
+    BOOL unused = e->state == CHILD_FD_CLOSED || (e->state == CHILD_FD_INHERITED && child_resolve(c, real) == real);
+    if (!unused) {
+        // The child already uses that number for something else.
+        fd = child_lowest_free(c, 0);
+        if (fd < 0) {
+            close(real);
+            return -1;
+        }
+    }
+    c->fds[fd] = (child_fd){ CHILD_FD_OWNED, cloexec ? 1 : 0, real };
+    return fd;
 }
 
 /// The descriptors the exec'd program gets as stdin/stdout/stderr.
@@ -665,13 +874,80 @@ static int launch_guest(const char *path, char *const argv[], char *const envp[]
     return request.result;
 }
 
-static BOOL is_mach_o(const char *path) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return NO;
-    uint32_t magic = 0;
-    ssize_t n = read(fd, &magic, sizeof(magic));
-    close(fd);
-    return n == sizeof(magic) && (magic == MH_MAGIC_64 || magic == FAT_MAGIC || magic == FAT_CIGAM);
+#define EXEC_MAX_INTERPRETERS 4
+#define SHEBANG_MAX 512
+
+static void free_argv(char **argv) {
+    if (!argv) return;
+    for (char **arg = argv; *arg; arg++) free(*arg);
+    free(argv);
+}
+
+static char **copy_argv(char *const argv[], int skip, char *const prefix[], int prefixCount) {
+    int count = 0;
+    while (argv[count]) count++;
+    int kept = count > skip ? count - skip : 0;
+    char **result = calloc((size_t)(prefixCount + kept + 1), sizeof(char *));
+    if (!result) return NULL;
+    for (int i = 0; i < prefixCount; i++) result[i] = strdup(prefix[i]);
+    for (int i = 0; i < kept; i++) result[prefixCount + i] = strdup(argv[skip + i]);
+    return result;
+}
+
+/// Works out what running `path` means: a Mach-O file to load, or for a
+/// script, the interpreter its "#!" line names. On success `resolved` is the
+/// file to load and `*newArgv`, unless NULL, replaces `argv`. Returns an
+/// errno value. A relative `path` is made absolute against the calling
+/// thread's working directory, since the program is loaded on another thread.
+static int resolve_exec(const char *path, char *const argv[], char resolved[PATH_MAX], char ***newArgv) {
+    *newArgv = NULL;
+    char current[PATH_MAX];
+    char cwd[PATH_MAX];
+    if (path[0] != '/' && getcwd(cwd, sizeof(cwd))) {
+        snprintf(current, sizeof(current), "%s/%s", cwd, path);
+    } else {
+        strlcpy(current, path, sizeof(current));
+    }
+
+    for (int depth = 0; ; depth++) {
+        char buffer[PATH_MAX];
+        strlcpy(resolved, guest_root_map(current, buffer), PATH_MAX);
+        struct stat st;
+        if (stat(resolved, &st) != 0) return errno;
+        if (!S_ISREG(st.st_mode) || access(resolved, X_OK) != 0) return EACCES;
+
+        int fd = open(resolved, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return errno;
+        char head[SHEBANG_MAX];
+        ssize_t n = read(fd, head, sizeof(head) - 1);
+        close(fd);
+        if (n < 2) return ENOEXEC;
+        head[n] = '\0';
+        uint32_t magic;
+        memcpy(&magic, head, sizeof(magic));
+        if (n >= 4 && (magic == MH_MAGIC_64 || magic == FAT_MAGIC || magic == FAT_CIGAM)) return 0;
+        if (head[0] != '#' || head[1] != '!' || depth == EXEC_MAX_INTERPRETERS) return ENOEXEC;
+
+        // "#!interpreter [args...]": like Darwin, split the arguments on
+        // whitespace, then pass the script's path and the original arguments.
+        char *line = head + 2;
+        char *end = strchr(line, '\n');
+        if (!end) return ENOEXEC;
+        *end = '\0';
+        char *words[16];
+        int count = 0;
+        for (char *word = strtok(line, " \t\r"); word && count < 15; word = strtok(NULL, " \t\r")) {
+            words[count++] = word;
+        }
+        if (count == 0) return ENOEXEC;
+        words[count++] = current;
+        char **previous = *newArgv;
+        char **next = copy_argv(previous ? previous : (char **)argv, 1, words, count);
+        free_argv(previous);
+        if (!next) return ENOMEM;
+        *newArgv = next;
+        strlcpy(current, words[0], sizeof(current));
+    }
 }
 
 static int child_execve(vfork_ctx *c, const char *path, char *const argv[], char *const envp[]) {
@@ -679,33 +955,33 @@ static int child_execve(vfork_ctx *c, const char *path, char *const argv[], char
         errno = EFAULT;
         return -1;
     }
-    char resolved[PATH_MAX];
-    if (path[0] != '/' && c->cwd[0]) {
-        snprintf(resolved, sizeof(resolved), "%s/%s", c->cwd, path);
-    } else {
-        strlcpy(resolved, path, sizeof(resolved));
-    }
-
-    struct stat st;
-    if (stat(resolved, &st) != 0) return -1;
-    if (!S_ISREG(st.st_mode) || access(resolved, X_OK) != 0) {
-        errno = EACCES;
+    if (!guest_launcher) {
+        errno = ENOEXEC;
         return -1;
     }
-    if (!is_mach_o(resolved) || !guest_launcher) {
-        errno = ENOEXEC;
+    char resolved[PATH_MAX];
+    char **scriptArgv = NULL;
+    int err = resolve_exec(path, argv, resolved, &scriptArgv);
+    if (err != 0) {
+        errno = err;
         return -1;
     }
 
     int fds[3];
     child_take_stdio(c, fds);
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
     os_unfair_lock_lock(&guest_lock);
     guest_process *g = guest_find_pid_locked(c->pid);
-    if (g) guest_set_fds_locked(g, fds);
+    if (g) {
+        guest_set_fds_locked(g, fds);
+        strlcpy(g->cwd, cwd, sizeof(g->cwd));
+    }
     os_unfair_lock_unlock(&guest_lock);
 
     static char *const emptyEnvironment[] = { NULL };
-    int err = launch_guest(resolved, argv, envp ? envp : emptyEnvironment, c->pid);
+    err = launch_guest(resolved, scriptArgv ? scriptArgv : argv, envp ? envp : emptyEnvironment, c->pid);
+    free_argv(scriptArgv);
     if (err != 0) {
         os_unfair_lock_lock(&guest_lock);
         if (g) {
@@ -722,18 +998,200 @@ static int child_execve(vfork_ctx *c, const char *path, char *const argv[], char
     child_finish(c);
 }
 
+/// execve() outside a fork: the new program takes over the caller's pid and
+/// descriptors, and the old one's threads and memory go away.
+static int exec_replace(uintptr_t caller, const char *path, char *const argv[], char *const envp[]) {
+    if (!path || !argv) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (!guest_launcher) {
+        errno = ENOEXEC;
+        return -1;
+    }
+    char resolved[PATH_MAX];
+    char **scriptArgv = NULL;
+    int err = resolve_exec(path, argv, resolved, &scriptArgv);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    if (!g) {
+        os_unfair_lock_unlock(&guest_lock);
+        free_argv(scriptArgv);
+        errno = ENOEXEC;
+        return -1;
+    }
+    pid_t pid = g->pid;
+    guest_process old = *g;
+    g->threads = NULL;
+    g->threadCount = g->threadCapacity = 0;
+    g->regions = NULL;
+    g->regionCount = g->regionCapacity = 0;
+    g->textStart = g->textEnd = 0;
+    g->header = NULL;
+    g->handle = NULL;
+    g->heap = NULL;
+    g->instancePath[0] = '\0';
+    os_unfair_lock_unlock(&guest_lock);
+
+    static char *const emptyEnvironment[] = { NULL };
+    err = launch_guest(resolved, scriptArgv ? scriptArgv : argv, envp ? envp : emptyEnvironment, pid);
+    free_argv(scriptArgv);
+    if (err != 0) {
+        os_unfair_lock_lock(&guest_lock);
+        g->threads = old.threads;
+        g->threadCount = old.threadCount;
+        g->threadCapacity = old.threadCapacity;
+        g->regions = old.regions;
+        g->regionCount = old.regionCount;
+        g->regionCapacity = old.regionCapacity;
+        g->textStart = old.textStart;
+        g->textEnd = old.textEnd;
+        g->header = old.header;
+        g->handle = old.handle;
+        g->heap = old.heap;
+        strlcpy(g->instancePath, old.instancePath, sizeof(g->instancePath));
+        os_unfair_lock_unlock(&guest_lock);
+        errno = err;
+        return -1;
+    }
+
+    os_unfair_lock_lock(&guest_lock);
+    BOOL stopped = guest_teardown_locked(&old);
+    os_unfair_lock_unlock(&guest_lock);
+    free(old.threads);
+    free(old.regions);
+    if (old.instancePath[0]) unlink(old.instancePath);
+    // This thread never returns into the old program's code.
+    if (stopped && old.handle) dlclose(old.handle);
+    if (stopped && old.heap) guest_heap_destroy(old.heap);
+    pthread_exit(NULL);
+}
+
+static char **guest_current_environ(uintptr_t caller);
+
+static int do_execve(uintptr_t caller, const char *path, char *const argv[], char *const envp[]) {
+    vfork_ctx *c = child_ctx();
+    if (c) return child_execve(c, path, argv, envp);
+    return exec_replace(caller, path, argv, envp);
+}
+
+/// execvp() and friends: searches `searchPath` (PATH by default) for `file`.
+static int exec_search(uintptr_t caller, const char *file, const char *searchPath, char *const argv[], char *const envp[]) {
+    if (!file || !file[0]) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (strchr(file, '/')) return do_execve(caller, file, argv, envp);
+    if (!searchPath) {
+        searchPath = "/usr/bin:/bin";
+        for (char *const *entry = envp; entry && *entry; entry++) {
+            if (strncmp(*entry, "PATH=", 5) == 0) {
+                searchPath = *entry + 5;
+                break;
+            }
+        }
+    }
+    int lastError = ENOENT;
+    char *paths = strdup(searchPath);
+    if (!paths) {
+        errno = ENOMEM;
+        return -1;
+    }
+    for (char *cursor = paths, *dir; (dir = strsep(&cursor, ":")); ) {
+        char candidate[PATH_MAX];
+        snprintf(candidate, sizeof(candidate), "%s/%s", dir[0] ? dir : ".", file);
+        do_execve(caller, candidate, argv, envp);
+        if (errno == ENOEXEC) {
+            // Like execvp(3), run a file that is not a program with sh.
+            char *prefix[] = { "sh", candidate };
+            char **shellArgv = copy_argv(argv, 1, prefix, 2);
+            if (shellArgv) do_execve(caller, "/bin/sh", shellArgv, envp);
+            free_argv(shellArgv);
+            lastError = errno;
+            break;
+        }
+        if (errno == EACCES) lastError = EACCES;
+        else if (errno != ENOENT && errno != ENOTDIR) {
+            lastError = errno;
+            break;
+        }
+    }
+    free(paths);
+    errno = lastError;
+    return -1;
+}
+
 #pragma mark - Hooks
 
 static int hook_execve(const char *path, char *const argv[], char *const envp[]) {
-    vfork_ctx *c = child_ctx();
-    if (c) return child_execve(c, path, argv, envp);
-    return execve(path, argv, envp);
+    return do_execve(CALLER, path, argv, envp);
+}
+
+static int hook_execv(const char *path, char *const argv[]) {
+    uintptr_t caller = CALLER;
+    return do_execve(caller, path, argv, guest_current_environ(caller));
+}
+
+static int hook_execvp(const char *file, char *const argv[]) {
+    uintptr_t caller = CALLER;
+    return exec_search(caller, file, NULL, argv, guest_current_environ(caller));
+}
+
+static int hook_execvP(const char *file, const char *searchPath, char *const argv[]) {
+    uintptr_t caller = CALLER;
+    return exec_search(caller, file, searchPath, argv, guest_current_environ(caller));
+}
+
+/// Collects the arguments of execl() and friends into an argv array.
+#define COLLECT_EXECL_ARGS(first, args, withEnvironment, environment)          \
+    int count_ = 1;                                                            \
+    va_start(args, first);                                                     \
+    while (va_arg(args, char *)) count_++;                                     \
+    va_end(args);                                                              \
+    char **argv_ = alloca(sizeof(char *) * (size_t)(count_ + 1));              \
+    argv_[0] = (char *)first;                                                  \
+    va_start(args, first);                                                     \
+    for (int i_ = 1; i_ <= count_; i_++) argv_[i_] = va_arg(args, char *);     \
+    if (withEnvironment) environment = va_arg(args, char **);                  \
+    va_end(args);
+
+static int hook_execl(const char *path, const char *arg0, ...) {
+    uintptr_t caller = CALLER;
+    va_list args;
+    char **unused = NULL;
+    COLLECT_EXECL_ARGS(arg0, args, NO, unused);
+    (void)unused;
+    return do_execve(caller, path, argv_, guest_current_environ(caller));
+}
+
+static int hook_execle(const char *path, const char *arg0, ...) {
+    uintptr_t caller = CALLER;
+    va_list args;
+    char **environment = NULL;
+    COLLECT_EXECL_ARGS(arg0, args, YES, environment);
+    return do_execve(caller, path, argv_, environment);
+}
+
+static int hook_execlp(const char *file, const char *arg0, ...) {
+    uintptr_t caller = CALLER;
+    va_list args;
+    char **unused = NULL;
+    COLLECT_EXECL_ARGS(arg0, args, NO, unused);
+    (void)unused;
+    return exec_search(caller, file, NULL, argv_, guest_current_environ(caller));
 }
 
 __attribute__((noreturn))
-static void hook_exit(int status) {
+static void guest_exit_with(uintptr_t caller, int status) {
     vfork_ctx *c = child_ctx();
     if (c) {
+        // The child's output is still in the parent program's stdio buffers.
+        guest_flush_stdio(c->programPid);
         os_unfair_lock_lock(&guest_lock);
         guest_process *g = guest_find_pid_locked(c->pid);
         if (g) guest_mark_exited_locked(g, W_EXITCODE(status & 0xff, 0));
@@ -741,15 +1199,23 @@ static void hook_exit(int status) {
         guest_notify_exit();
         child_finish(c);
     }
-    guest_exit_current(CALLER, W_EXITCODE(status & 0xff, 0));
+    pid_t pid = guest_pid_at(caller);
+    if (pid) guest_flush_stdio(pid);
+    guest_exit_current(caller, W_EXITCODE(status & 0xff, 0));
 }
 
-static pid_t hook_wait4(pid_t pid, int *status, int options, struct rusage *usage) {
+__attribute__((noreturn))
+static void hook_exit(int status) {
+    guest_exit_with(CALLER, status);
+}
+
+static pid_t guest_wait(uintptr_t callerAddress, pid_t pid, int *status, int options, struct rusage *usage) {
     if (pid > 0 && pid < GUEST_PID_BASE) return wait4(pid, status, options, usage);
 
+    vfork_ctx *c = child_ctx();
     os_unfair_lock_lock(&guest_lock);
-    guest_process *caller = guest_find_address_locked(CALLER);
-    pid_t callerPid = caller ? caller->pid : 0;
+    guest_process *caller = guest_find_address_locked(callerAddress);
+    pid_t callerPid = c ? c->pid : (caller ? caller->pid : 0);
     os_unfair_lock_unlock(&guest_lock);
 
     pthread_mutex_lock(&guest_wait_lock);
@@ -796,8 +1262,12 @@ static pid_t hook_wait4(pid_t pid, int *status, int options, struct rusage *usag
     }
 }
 
+static pid_t hook_wait4(pid_t pid, int *status, int options, struct rusage *usage) {
+    return guest_wait(CALLER, pid, status, options, usage);
+}
+
 static pid_t hook_waitpid(pid_t pid, int *status, int options) {
-    return hook_wait4(pid, status, options, NULL);
+    return guest_wait(CALLER, pid, status, options, NULL);
 }
 
 static int hook_kill(pid_t pid, int sig) {
@@ -810,6 +1280,9 @@ static int hook_kill(pid_t pid, int sig) {
             errno = ESRCH;
             return -1;
         }
+        // A program signalling itself, as `kill $$` does, ends.
+        BOOL fatal = sig == SIGTERM || sig == SIGKILL || sig == SIGINT || sig == SIGHUP || sig == SIGQUIT || sig == SIGABRT;
+        if (fatal && !child_ctx() && guest_pid_at(CALLER) == pid) guest_exit_current(CALLER, sig);
         // Guests are threads of this process; there is no way to deliver it.
         if (sig != 0) NSLog(@"kill(%d, %d) on a guest process is not supported", pid, sig);
         return 0;
@@ -836,7 +1309,19 @@ static int hook_sigaction(int sig, const struct sigaction *act, struct sigaction
 
 static pid_t hook_getpid(void) {
     vfork_ctx *c = child_ctx();
-    return c ? c->pid : getpid();
+    if (c) return c->pid;
+    pid_t pid = guest_pid_at(CALLER);
+    return pid ? pid : getpid();
+}
+
+static pid_t hook_getppid(void) {
+    vfork_ctx *c = child_ctx();
+    if (c) return c->parentPid ? c->parentPid : getpid();
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    pid_t ppid = (g && g->spawned) ? (g->ppid ? g->ppid : 1) : getppid();
+    os_unfair_lock_unlock(&guest_lock);
+    return ppid;
 }
 
 static pid_t hook_setsid(void) {
@@ -868,26 +1353,35 @@ static int hook_chroot(const char *path) {
     return child_ctx() ? 0 : chroot(path);
 }
 
-static int hook_chdir(const char *path) {
+/// Records the calling thread's new working directory as its program's.
+static void guest_note_cwd(uintptr_t caller) {
     vfork_ctx *c = child_ctx();
-    if (!c) return chdir(path);
-    // The working directory is process-wide; the exec'd program gets $PWD.
-    char resolved[PATH_MAX];
-    if (path[0] == '/') {
-        strlcpy(resolved, path, sizeof(resolved));
-    } else {
-        char base[PATH_MAX];
-        if (c->cwd[0]) strlcpy(base, c->cwd, sizeof(base));
-        else if (!getcwd(base, sizeof(base))) return -1;
-        snprintf(resolved, sizeof(resolved), "%s/%s", base, path);
+    if (c) {
+        c->changedCwd = YES;
+        return;
     }
-    struct stat st;
-    if (stat(resolved, &st) != 0) return -1;
-    if (!S_ISDIR(st.st_mode)) {
-        errno = ENOTDIR;
-        return -1;
-    }
-    strlcpy(c->cwd, resolved, sizeof(c->cwd));
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) return;
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    if (g) strlcpy(g->cwd, cwd, sizeof(g->cwd));
+    os_unfair_lock_unlock(&guest_lock);
+}
+
+static int hook_chdir(const char *path) {
+    char buffer[PATH_MAX];
+    path = guest_root_map(path, buffer);
+    if (pthread_chdir_np(path) != 0) return -1;
+    guest_note_cwd(CALLER);
+    return 0;
+}
+
+static int map_fd(int fd, uintptr_t caller);
+
+static int hook_fchdir(int fd) {
+    uintptr_t caller = CALLER;
+    if (pthread_fchdir_np(map_fd(fd, caller)) != 0) return -1;
+    guest_note_cwd(caller);
     return 0;
 }
 
@@ -1078,6 +1572,8 @@ static void *guest_thread_main(void *context) {
     }
     guest_add_thread_locked(g, mach_thread_self());
     os_unfair_lock_unlock(&guest_lock);
+    pthread_setspecific(guest_thread_key, g);
+    guest_enter_cwd(g);
     return start.start(start.arg);
 }
 
@@ -1123,6 +1619,856 @@ static int hook_munmap(void *addr, size_t length) {
     return result;
 }
 
+#pragma mark - Process information
+
+// Seen by callers outside any guest image, such as a library a program
+// loaded: the most recently started program's.
+static int fallback_argc;
+static char **fallback_argv;
+static char fallback_executable_path[PATH_MAX];
+
+void guest_set_process_info(pid_t pid, int argc, char **argv, char **envp, const char *executablePath) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_pid_locked(pid);
+    if (g) {
+        g->argc = argc;
+        g->argv = argv;
+        strlcpy(g->executablePath, executablePath, sizeof(g->executablePath));
+        // The old program's threads may still be reading the previous array
+        // after an exec, so it is not freed.
+        g->environ = envp;
+        g->environOwned = NO;
+    }
+    fallback_argc = argc;
+    fallback_argv = argv;
+    strlcpy(fallback_executable_path, executablePath, sizeof(fallback_executable_path));
+    os_unfair_lock_unlock(&guest_lock);
+}
+
+static int *hook_NSGetArgc(void) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    int *result = g ? &g->argc : &fallback_argc;
+    os_unfair_lock_unlock(&guest_lock);
+    return result;
+}
+
+static char ***hook_NSGetArgv(void) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    char ***result = g ? &g->argv : &fallback_argv;
+    os_unfair_lock_unlock(&guest_lock);
+    return result;
+}
+
+static int hook_NSGetExecutablePath(char *buf, uint32_t *bufsize) {
+    char path[PATH_MAX];
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    strlcpy(path, g ? g->executablePath : fallback_executable_path, sizeof(path));
+    os_unfair_lock_unlock(&guest_lock);
+    uint32_t needed = (uint32_t)strlen(path) + 1;
+    if (*bufsize < needed) {
+        *bufsize = needed;
+        return -1;
+    }
+    memcpy(buf, path, needed);
+    return 0;
+}
+
+static char ***hook_NSGetEnviron(void) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    char ***result = g ? &g->environ : _NSGetEnviron();
+    os_unfair_lock_unlock(&guest_lock);
+    return result;
+}
+
+/// Opens a patched copy of a library a program loads itself, such as a Ruby
+/// extension: built for macOS, the original cannot be loaded here.
+static void *hook_dlopen(const char *path, int mode) {
+    if (!path || !guest_library_loader) return dlopen(path, mode);
+    char executablePath[PATH_MAX] = "";
+    const void *header = NULL;
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    if (g) {
+        header = g->header;
+        strlcpy(executablePath, g->executablePath, sizeof(executablePath));
+    }
+    os_unfair_lock_unlock(&guest_lock);
+    Dl_info image;
+    if (!header || !dladdr(header, &image) || !image.dli_fname) return dlopen(path, mode);
+    const char *programImage = image.dli_fname;
+    char buffer[PATH_MAX];
+    const char *mapped = guest_root_map(path, buffer);
+    char loadable[PATH_MAX];
+    if (mapped[0] == '/' && guest_library_loader(mapped, programImage, executablePath, loadable)) {
+        return dlopen(loadable, mode);
+    }
+    return dlopen(path, mode);
+}
+
+/// For an address in a program's own image, names the program's file rather
+/// than the patched copy that was loaded, so programs that find their files
+/// relative to themselves (Ruby's load path) look in the right place.
+static int hook_dladdr(const void *address, Dl_info *info) {
+    int result = dladdr(address, info);
+    if (!result) return result;
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked((uintptr_t)address);
+    if (g && info->dli_fbase == (void *)g->header && g->executablePath[0]) {
+        info->dli_fname = g->executablePath;
+    }
+    os_unfair_lock_unlock(&guest_lock);
+    return result;
+}
+
+static const char *hook_getprogname(void) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    const char *name = (g && g->argv && g->argv[0]) ? g->argv[0] : NULL;
+    os_unfair_lock_unlock(&guest_lock);
+    if (!name) return getprogname();
+    const char *slash = strrchr(name, '/');
+    return slash ? slash + 1 : name;
+}
+
+static char **guest_current_environ(uintptr_t caller) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    char **result = g ? g->environ : *_NSGetEnviron();
+    os_unfair_lock_unlock(&guest_lock);
+    return result;
+}
+
+#pragma mark - Users and groups
+
+// iOS has no account database for the app's user, so programs that look up
+// their own user or group (id, Homebrew) get one made up here: "mobile",
+// with the program's $HOME.
+#define GUEST_USER_NAME "mobile"
+
+static BOOL guest_is_own_uid(uid_t uid) { return uid == getuid() || uid == geteuid(); }
+static BOOL guest_is_own_gid(gid_t gid) { return gid == getgid() || gid == getegid(); }
+
+/// Copies `string` into the caller's buffer for a *_r lookup.
+static char *guest_store(const char *string, char **buffer, size_t *remaining) {
+    size_t length = strlen(string) + 1;
+    if (length > *remaining) return NULL;
+    char *result = memcpy(*buffer, string, length);
+    *buffer += length;
+    *remaining -= length;
+    return result;
+}
+
+static int guest_own_passwd(uintptr_t caller, struct passwd *pw, char *buffer, size_t size) {
+    const char *home = NULL;
+    char **environment = guest_current_environ(caller);
+    for (char **entry = environment; entry && *entry; entry++) {
+        if (strncmp(*entry, "HOME=", 5) == 0) home = *entry + 5;
+    }
+    if (!home) home = "/";
+    memset(pw, 0, sizeof(*pw));
+    pw->pw_uid = geteuid();
+    pw->pw_gid = getegid();
+    if (!(pw->pw_name = guest_store(GUEST_USER_NAME, &buffer, &size)) ||
+        !(pw->pw_passwd = guest_store("*", &buffer, &size)) ||
+        !(pw->pw_gecos = guest_store("Mobile User", &buffer, &size)) ||
+        !(pw->pw_dir = guest_store(home, &buffer, &size)) ||
+        !(pw->pw_shell = guest_store("/bin/bash", &buffer, &size)) ||
+        !(pw->pw_class = guest_store("", &buffer, &size))) {
+        return ERANGE;
+    }
+    return 0;
+}
+
+static int guest_own_group(struct group *gr, char *buffer, size_t size) {
+    memset(gr, 0, sizeof(*gr));
+    gr->gr_gid = getegid();
+    // gr_mem: a pointer-aligned, empty member list.
+    uintptr_t aligned = ((uintptr_t)buffer + sizeof(char *) - 1) & ~(uintptr_t)(sizeof(char *) - 1);
+    if (aligned + sizeof(char *) > (uintptr_t)buffer + size) return ERANGE;
+    size -= aligned + sizeof(char *) - (uintptr_t)buffer;
+    gr->gr_mem = (char **)aligned;
+    gr->gr_mem[0] = NULL;
+    buffer = (char *)(aligned + sizeof(char *));
+    if (!(gr->gr_name = guest_store(GUEST_USER_NAME, &buffer, &size)) ||
+        !(gr->gr_passwd = guest_store("*", &buffer, &size))) {
+        return ERANGE;
+    }
+    return 0;
+}
+
+static struct passwd guest_passwd;
+static char guest_passwd_buffer[PATH_MAX + 256];
+static struct group guest_group;
+static char guest_group_buffer[256];
+
+static struct passwd *hook_getpwuid(uid_t uid) {
+    struct passwd *result = getpwuid(uid);
+    if (result || !guest_is_own_uid(uid)) return result;
+    return guest_own_passwd(CALLER, &guest_passwd, guest_passwd_buffer, sizeof(guest_passwd_buffer)) == 0 ? &guest_passwd : NULL;
+}
+
+static struct passwd *hook_getpwnam(const char *name) {
+    struct passwd *result = getpwnam(name);
+    if (result || !name || strcmp(name, GUEST_USER_NAME) != 0) return result;
+    return guest_own_passwd(CALLER, &guest_passwd, guest_passwd_buffer, sizeof(guest_passwd_buffer)) == 0 ? &guest_passwd : NULL;
+}
+
+static int hook_getpwuid_r(uid_t uid, struct passwd *pw, char *buffer, size_t size, struct passwd **result) {
+    int err = getpwuid_r(uid, pw, buffer, size, result);
+    if ((err == 0 && *result) || !guest_is_own_uid(uid)) return err;
+    err = guest_own_passwd(CALLER, pw, buffer, size);
+    *result = err == 0 ? pw : NULL;
+    return err;
+}
+
+static int hook_getpwnam_r(const char *name, struct passwd *pw, char *buffer, size_t size, struct passwd **result) {
+    int err = getpwnam_r(name, pw, buffer, size, result);
+    if ((err == 0 && *result) || !name || strcmp(name, GUEST_USER_NAME) != 0) return err;
+    err = guest_own_passwd(CALLER, pw, buffer, size);
+    *result = err == 0 ? pw : NULL;
+    return err;
+}
+
+static struct group *hook_getgrgid(gid_t gid) {
+    struct group *result = getgrgid(gid);
+    if (result || !guest_is_own_gid(gid)) return result;
+    return guest_own_group(&guest_group, guest_group_buffer, sizeof(guest_group_buffer)) == 0 ? &guest_group : NULL;
+}
+
+static struct group *hook_getgrnam(const char *name) {
+    struct group *result = getgrnam(name);
+    if (result || !name || strcmp(name, GUEST_USER_NAME) != 0) return result;
+    return guest_own_group(&guest_group, guest_group_buffer, sizeof(guest_group_buffer)) == 0 ? &guest_group : NULL;
+}
+
+static int hook_getgrgid_r(gid_t gid, struct group *gr, char *buffer, size_t size, struct group **result) {
+    int err = getgrgid_r(gid, gr, buffer, size, result);
+    if ((err == 0 && *result) || !guest_is_own_gid(gid)) return err;
+    err = guest_own_group(gr, buffer, size);
+    *result = err == 0 ? gr : NULL;
+    return err;
+}
+
+static int hook_getgrnam_r(const char *name, struct group *gr, char *buffer, size_t size, struct group **result) {
+    int err = getgrnam_r(name, gr, buffer, size, result);
+    if ((err == 0 && *result) || !name || strcmp(name, GUEST_USER_NAME) != 0) return err;
+    err = guest_own_group(gr, buffer, size);
+    *result = err == 0 ? gr : NULL;
+    return err;
+}
+
+#pragma mark - Environment
+
+// Each program has its own environment, from the envp it was started with.
+// Arrays replaced by setenv() are not freed: getenv() results point into
+// them, and another thread may be reading one.
+
+static char *env_find(char **env, const char *name, size_t length) {
+    for (; env && *env; env++) {
+        if (strncmp(*env, name, length) == 0 && (*env)[length] == '=') return *env;
+    }
+    return NULL;
+}
+
+/// Replaces the variable `entry` ("NAME=value") names, or adds it.
+static int env_put_locked(guest_process *g, char *entry, size_t nameLength) {
+    int count = 0;
+    while (g->environ && g->environ[count]) count++;
+    char **next = malloc(sizeof(char *) * (size_t)(count + 2));
+    if (!next) return ENOMEM;
+    int used = 0;
+    BOOL replaced = NO;
+    for (int i = 0; i < count; i++) {
+        char *existing = g->environ[i];
+        if (!replaced && strncmp(existing, entry, nameLength) == 0 && existing[nameLength] == '=') {
+            next[used++] = entry;
+            replaced = YES;
+        } else {
+            next[used++] = existing;
+        }
+    }
+    if (!replaced) next[used++] = entry;
+    next[used] = NULL;
+    g->environ = next;
+    g->environOwned = YES;
+    return 0;
+}
+
+static char *hook_getenv(const char *name) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    if (!g) {
+        os_unfair_lock_unlock(&guest_lock);
+        return getenv(name);
+    }
+    char *entry = name ? env_find(g->environ, name, strlen(name)) : NULL;
+    os_unfair_lock_unlock(&guest_lock);
+    return entry ? entry + strlen(name) + 1 : NULL;
+}
+
+static BOOL env_valid_name(const char *name) {
+    return name && name[0] && !strchr(name, '=');
+}
+
+static int hook_setenv(const char *name, const char *value, int overwrite) {
+    uintptr_t caller = CALLER;
+    if (guest_pid_at(caller) == 0) return setenv(name, value, overwrite);
+    if (!env_valid_name(name)) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t length = strlen(name);
+    if (!value) value = "";
+    char *entry = malloc(length + strlen(value) + 2);
+    if (!entry) {
+        errno = ENOMEM;
+        return -1;
+    }
+    sprintf(entry, "%s=%s", name, value);
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    int err = 0;
+    if (g && (overwrite || !env_find(g->environ, name, length))) {
+        err = env_put_locked(g, entry, length);
+    } else {
+        free(entry);
+    }
+    os_unfair_lock_unlock(&guest_lock);
+    if (err) {
+        errno = err;
+        return -1;
+    }
+    return 0;
+}
+
+static int hook_putenv(char *string) {
+    uintptr_t caller = CALLER;
+    if (guest_pid_at(caller) == 0) return putenv(string);
+    char *equals = string ? strchr(string, '=') : NULL;
+    if (!equals || equals == string) {
+        errno = EINVAL;
+        return -1;
+    }
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    int err = g ? env_put_locked(g, string, (size_t)(equals - string)) : 0;
+    os_unfair_lock_unlock(&guest_lock);
+    if (err) {
+        errno = err;
+        return -1;
+    }
+    return 0;
+}
+
+static int hook_unsetenv(const char *name) {
+    uintptr_t caller = CALLER;
+    if (guest_pid_at(caller) == 0) return unsetenv(name);
+    if (!env_valid_name(name)) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t length = strlen(name);
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    if (g && env_find(g->environ, name, length)) {
+        int count = 0;
+        while (g->environ[count]) count++;
+        char **next = malloc(sizeof(char *) * (size_t)(count + 1));
+        if (next) {
+            int used = 0;
+            for (int i = 0; i < count; i++) {
+                char *existing = g->environ[i];
+                if (strncmp(existing, name, length) == 0 && existing[length] == '=') continue;
+                next[used++] = existing;
+            }
+            next[used] = NULL;
+            g->environ = next;
+            g->environOwned = YES;
+        }
+    }
+    os_unfair_lock_unlock(&guest_lock);
+    return 0;
+}
+
+#pragma mark - Standard I/O
+
+// Each program gets its own stdin/stdout/stderr FILEs, which read and write
+// whatever its descriptors 0, 1 and 2 are at the time, including a forked
+// child's redirections. libc's own would use the app's descriptors.
+
+static int guest_stdio_descriptor(void *cookie) {
+    pid_t pid = (pid_t)((intptr_t)cookie >> 2);
+    int fd = (int)((intptr_t)cookie & 3);
+    vfork_ctx *c = child_ctx();
+    if (c) return child_resolve(c, fd);
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_pid_locked(pid);
+    int real = g ? g->fds[fd] : -1;
+    os_unfair_lock_unlock(&guest_lock);
+    if (real == -1) return fd;
+    return real == GUEST_FD_CLOSED ? -1 : real;
+}
+
+static int guest_stdio_read(void *cookie, char *buffer, int length) {
+    int fd = guest_stdio_descriptor(cookie);
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    return (int)read(fd, buffer, (size_t)length);
+}
+
+static int guest_stdio_write(void *cookie, const char *buffer, int length) {
+    int fd = guest_stdio_descriptor(cookie);
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    return (int)write(fd, buffer, (size_t)length);
+}
+
+static int guest_stdio_close(void *cookie) {
+    return 0;
+}
+
+static void guest_open_stdio_locked(guest_process *g) {
+    for (int fd = 0; fd < 3; fd++) {
+        if (g->stdio[fd]) continue;
+        FILE *file = funopen((void *)(intptr_t)(g->pid * 4 + fd),
+                             fd == 0 ? guest_stdio_read : NULL,
+                             fd == 0 ? NULL : guest_stdio_write,
+                             NULL, guest_stdio_close);
+        if (!file) continue;
+        // What fileno() returns; the program's hooked calls map it.
+        file->_file = (short)fd;
+        int real = g->fds[fd] == -1 ? fd : g->fds[fd];
+        int mode = fd == 2 ? _IONBF : (fd == 1 && real >= 0 && isatty(real)) ? _IOLBF : _IOFBF;
+        setvbuf(file, NULL, mode, mode == _IONBF ? 0 : BUFSIZ);
+        g->stdio[fd] = file;
+    }
+}
+
+static void guest_flush_stdio(pid_t pid) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_pid_locked(pid);
+    FILE *out = g ? g->stdio[1] : NULL;
+    FILE *err = g ? g->stdio[2] : NULL;
+    os_unfair_lock_unlock(&guest_lock);
+    if (out) fflush(out);
+    if (err) fflush(err);
+}
+
+static FILE *guest_stdio(uintptr_t caller, int fd) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    FILE *file = g ? g->stdio[fd] : NULL;
+    os_unfair_lock_unlock(&guest_lock);
+    if (file) return file;
+    return fd == 0 ? stdin : fd == 1 ? stdout : stderr;
+}
+
+static int hook_fclose(FILE *file) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    BOOL own = g && file && (file == g->stdio[0] || file == g->stdio[1] || file == g->stdio[2]);
+    os_unfair_lock_unlock(&guest_lock);
+    // The FILE outlives the program's use of it; the descriptor stays open.
+    if (own) return fflush(file);
+    return fclose(file);
+}
+
+static int hook_printf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    int result = vfprintf(guest_stdio(CALLER, 1), format, args);
+    va_end(args);
+    return result;
+}
+
+static int hook_vprintf(const char *format, va_list args) {
+    return vfprintf(guest_stdio(CALLER, 1), format, args);
+}
+
+static int hook_puts(const char *string) {
+    FILE *file = guest_stdio(CALLER, 1);
+    if (fputs(string, file) == EOF || putc('\n', file) == EOF) return EOF;
+    return 0;
+}
+
+static int hook_putchar(int c) {
+    return putc(c, guest_stdio(CALLER, 1));
+}
+
+static int hook_putchar_unlocked(int c) {
+    return putc_unlocked(c, guest_stdio(CALLER, 1));
+}
+
+static int hook_getchar(void) {
+    return getc(guest_stdio(CALLER, 0));
+}
+
+static int hook_getchar_unlocked(void) {
+    return getc_unlocked(guest_stdio(CALLER, 0));
+}
+
+static int hook_scanf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    int result = vfscanf(guest_stdio(CALLER, 0), format, args);
+    va_end(args);
+    return result;
+}
+
+static int hook_vscanf(const char *format, va_list args) {
+    return vfscanf(guest_stdio(CALLER, 0), format, args);
+}
+
+static void hook_perror(const char *message) {
+    int code = errno;
+    FILE *file = guest_stdio(CALLER, 2);
+    if (message && message[0]) fprintf(file, "%s: ", message);
+    fprintf(file, "%s\n", strerror(code));
+    errno = code;
+}
+
+/// err(3) and warn(3), which would otherwise print the app's name to the app's stderr.
+static void guest_vwarn(uintptr_t caller, BOOL withCode, int code, const char *format, va_list args) {
+    FILE *file = guest_stdio(caller, 2);
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    const char *name = (g && g->argv && g->argv[0]) ? g->argv[0] : getprogname();
+    os_unfair_lock_unlock(&guest_lock);
+    const char *slash = strrchr(name, '/');
+    fprintf(file, "%s: ", slash ? slash + 1 : name);
+    if (format) {
+        vfprintf(file, format, args);
+        if (withCode) fputs(": ", file);
+    }
+    if (withCode) fputs(strerror(code), file);
+    putc('\n', file);
+}
+
+#define WARN_HOOK(hookName, withCode, codeExpression)                          \
+    static void hookName(const char *format, ...) {                            \
+        int code_ = (codeExpression);                                          \
+        va_list args;                                                          \
+        va_start(args, format);                                                \
+        guest_vwarn(CALLER, withCode, code_, format, args);                    \
+        va_end(args);                                                          \
+    }
+
+WARN_HOOK(hook_warn, YES, errno)
+WARN_HOOK(hook_warnx, NO, 0)
+
+static void hook_vwarn(const char *format, va_list args) {
+    guest_vwarn(CALLER, YES, errno, format, args);
+}
+
+static void hook_vwarnx(const char *format, va_list args) {
+    guest_vwarn(CALLER, NO, 0, format, args);
+}
+
+static void hook_warnc(int code, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    guest_vwarn(CALLER, YES, code, format, args);
+    va_end(args);
+}
+
+static void hook_vwarnc(int code, const char *format, va_list args) {
+    guest_vwarn(CALLER, YES, code, format, args);
+}
+
+__attribute__((noreturn)) static void hook_err(int status, const char *format, ...) {
+    uintptr_t caller = CALLER;
+    va_list args;
+    va_start(args, format);
+    guest_vwarn(caller, YES, errno, format, args);
+    va_end(args);
+    guest_exit_with(caller, status);
+}
+
+__attribute__((noreturn)) static void hook_errx(int status, const char *format, ...) {
+    uintptr_t caller = CALLER;
+    va_list args;
+    va_start(args, format);
+    guest_vwarn(caller, NO, 0, format, args);
+    va_end(args);
+    guest_exit_with(caller, status);
+}
+
+__attribute__((noreturn)) static void hook_errc(int status, int code, const char *format, ...) {
+    uintptr_t caller = CALLER;
+    va_list args;
+    va_start(args, format);
+    guest_vwarn(caller, YES, code, format, args);
+    va_end(args);
+    guest_exit_with(caller, status);
+}
+
+__attribute__((noreturn)) static void hook_verr(int status, const char *format, va_list args) {
+    uintptr_t caller = CALLER;
+    guest_vwarn(caller, YES, errno, format, args);
+    guest_exit_with(caller, status);
+}
+
+__attribute__((noreturn)) static void hook_verrx(int status, const char *format, va_list args) {
+    uintptr_t caller = CALLER;
+    guest_vwarn(caller, NO, 0, format, args);
+    guest_exit_with(caller, status);
+}
+
+__attribute__((noreturn)) static void hook_verrc(int status, int code, const char *format, va_list args) {
+    uintptr_t caller = CALLER;
+    guest_vwarn(caller, YES, code, format, args);
+    guest_exit_with(caller, status);
+}
+
+#pragma mark - Paths
+
+// Absolute paths under /bin, /usr and /etc go through the guest root.
+#define MAP_PATH(path) char path##_buffer[PATH_MAX]; path = guest_root_map(path, path##_buffer)
+
+static int hook_open(const char *path, int flags, ...) {
+    int mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, int);
+        va_end(args);
+    }
+    MAP_PATH(path);
+    int fd = open(path, flags, mode);
+    vfork_ctx *c = child_ctx();
+    return c ? child_adopt(c, fd, (flags & O_CLOEXEC) != 0) : fd;
+}
+
+static int hook_openat(int fd, const char *path, int flags, ...) {
+    int mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, int);
+        va_end(args);
+    }
+    MAP_PATH(path);
+    vfork_ctx *c = child_ctx();
+    if (c && fd >= 0) fd = map_fd(fd, 0);
+    int result = openat(fd, path, flags, mode);
+    return c ? child_adopt(c, result, (flags & O_CLOEXEC) != 0) : result;
+}
+
+static int hook_pipe(int fds[2]) {
+    vfork_ctx *c = child_ctx();
+    if (!c) return pipe(fds);
+    int real[2];
+    if (pipe(real) != 0) return -1;
+    fds[0] = child_adopt(c, real[0], NO);
+    fds[1] = child_adopt(c, real[1], NO);
+    if (fds[0] < 0 || fds[1] < 0) {
+        if (fds[0] >= 0) hook_close(fds[0]);
+        if (fds[1] >= 0) hook_close(fds[1]);
+        errno = EMFILE;
+        return -1;
+    }
+    return 0;
+}
+
+static int hook_socket(int domain, int type, int protocol) {
+    int fd = socket(domain, type, protocol);
+    vfork_ctx *c = child_ctx();
+    return c ? child_adopt(c, fd, NO) : fd;
+}
+
+static int hook_socketpair(int domain, int type, int protocol, int fds[2]) {
+    vfork_ctx *c = child_ctx();
+    if (!c) return socketpair(domain, type, protocol, fds);
+    int real[2];
+    if (socketpair(domain, type, protocol, real) != 0) return -1;
+    fds[0] = child_adopt(c, real[0], NO);
+    fds[1] = child_adopt(c, real[1], NO);
+    return (fds[0] < 0 || fds[1] < 0) ? -1 : 0;
+}
+
+static int hook_mkstemp(char *template) {
+    int fd = mkstemp(template);
+    vfork_ctx *c = child_ctx();
+    return c ? child_adopt(c, fd, NO) : fd;
+}
+
+static int hook_mkstemps(char *template, int suffixLength) {
+    int fd = mkstemps(template, suffixLength);
+    vfork_ctx *c = child_ctx();
+    return c ? child_adopt(c, fd, NO) : fd;
+}
+
+static int hook_mkostemp(char *template, int flags) {
+    int fd = mkostemp(template, flags);
+    vfork_ctx *c = child_ctx();
+    return c ? child_adopt(c, fd, (flags & O_CLOEXEC) != 0) : fd;
+}
+
+static FILE *hook_fopen(const char *path, const char *mode) {
+    MAP_PATH(path);
+    return fopen(path, mode);
+}
+
+static int hook_stat(const char *path, struct stat *st) {
+    MAP_PATH(path);
+    return stat(path, st);
+}
+
+static int hook_lstat(const char *path, struct stat *st) {
+    MAP_PATH(path);
+    return lstat(path, st);
+}
+
+static int hook_fstatat(int fd, const char *path, struct stat *st, int flag) {
+    MAP_PATH(path);
+    return fstatat(fd, path, st, flag);
+}
+
+static int hook_access(const char *path, int mode) {
+    MAP_PATH(path);
+    return access(path, mode);
+}
+
+static int hook_faccessat(int fd, const char *path, int mode, int flag) {
+    MAP_PATH(path);
+    return faccessat(fd, path, mode, flag);
+}
+
+static DIR *hook_opendir(const char *path) {
+    MAP_PATH(path);
+    return opendir(path);
+}
+
+static ssize_t hook_readlink(const char *path, char *buffer, size_t size) {
+    MAP_PATH(path);
+    return readlink(path, buffer, size);
+}
+
+static char *hook_realpath(const char *path, char *resolved) {
+    MAP_PATH(path);
+    return realpath(path, resolved);
+}
+
+#pragma mark - Memory
+
+// A forked child shares the parent's memory. Programs with their own heap
+// get it back as it was when the child ends. Other memory the child frees
+// may still be the parent's, so it is left alone.
+
+static inline guest_heap *current_heap(void) {
+    guest_process *g = pthread_getspecific(guest_thread_key);
+    return g ? g->heap : NULL;
+}
+
+static void *hook_malloc(size_t size) {
+    guest_heap *heap = current_heap();
+    return heap ? guest_heap_malloc(heap, size) : malloc(size);
+}
+
+static void *hook_calloc(size_t count, size_t size) {
+    guest_heap *heap = current_heap();
+    if (!heap) return calloc(count, size);
+    size_t total;
+    if (__builtin_mul_overflow(count, size, &total)) return NULL;
+    void *result = guest_heap_malloc(heap, total);
+    if (result) memset(result, 0, total);
+    return result;
+}
+
+static void hook_free(void *pointer) {
+    if (!pointer) return;
+    guest_heap *heap = current_heap();
+    if (heap && guest_heap_contains(heap, pointer)) {
+        guest_heap_free(heap, pointer);
+        return;
+    }
+    if (child_ctx()) return;
+    free(pointer);
+}
+
+static void *hook_realloc(void *pointer, size_t size) {
+    if (!pointer) return hook_malloc(size);
+    guest_heap *heap = current_heap();
+    BOOL own = heap && guest_heap_contains(heap, pointer);
+    if (!own && !child_ctx()) return realloc(pointer, size);
+    size_t old = own ? guest_heap_size(heap, pointer) : malloc_size(pointer);
+    if (own && size <= old) return pointer;
+    void *copy = heap ? guest_heap_malloc(heap, size) : malloc(size ? size : 1);
+    if (!copy) return NULL;
+    memcpy(copy, pointer, old < size ? old : size);
+    if (own) guest_heap_free(heap, pointer);
+    return copy;
+}
+
+static void *hook_reallocf(void *pointer, size_t size) {
+    void *result = hook_realloc(pointer, size);
+    if (!result && pointer && size) hook_free(pointer);
+    return result;
+}
+
+static size_t hook_malloc_size(const void *pointer) {
+    guest_heap *heap = current_heap();
+    if (heap && guest_heap_contains(heap, pointer)) return guest_heap_size(heap, pointer);
+    return malloc_size(pointer);
+}
+
+static int hook_posix_memalign(void **result, size_t alignment, size_t size) {
+    guest_heap *heap = current_heap();
+    if (!heap) return posix_memalign(result, alignment, size);
+    if (alignment < sizeof(void *) || (alignment & (alignment - 1))) return EINVAL;
+    void *memory = guest_heap_aligned(heap, alignment, size);
+    if (!memory) return ENOMEM;
+    *result = memory;
+    return 0;
+}
+
+static void *hook_aligned_alloc(size_t alignment, size_t size) {
+    guest_heap *heap = current_heap();
+    return heap ? guest_heap_aligned(heap, alignment, size) : aligned_alloc(alignment, size);
+}
+
+static void *hook_valloc(size_t size) {
+    guest_heap *heap = current_heap();
+    return heap ? guest_heap_aligned(heap, PAGE_SIZE, size) : valloc(size);
+}
+
+/// Whether the image imports any of `names`.
+static BOOL image_imports(const struct mach_header_64 *header, intptr_t slide, const char *const names[], int count) {
+    const struct symtab_command *symtab = NULL;
+    const struct dysymtab_command *dysymtab = NULL;
+    const struct segment_command_64 *linkedit = NULL;
+    const uint8_t *cursor = (const uint8_t *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SYMTAB) symtab = (const struct symtab_command *)lc;
+        if (lc->cmd == LC_DYSYMTAB) dysymtab = (const struct dysymtab_command *)lc;
+        if (lc->cmd == LC_SEGMENT_64 && strcmp(((const struct segment_command_64 *)lc)->segname, SEG_LINKEDIT) == 0) {
+            linkedit = (const struct segment_command_64 *)lc;
+        }
+        cursor += lc->cmdsize;
+    }
+    if (!symtab || !dysymtab || !linkedit) return NO;
+    uintptr_t base = (uintptr_t)(linkedit->vmaddr + slide - linkedit->fileoff);
+    const struct nlist_64 *symbols = (const struct nlist_64 *)(base + symtab->symoff);
+    const char *strings = (const char *)(base + symtab->stroff);
+    for (uint32_t i = dysymtab->iundefsym; i < dysymtab->iundefsym + dysymtab->nundefsym; i++) {
+        const char *name = strings + symbols[i].n_un.n_strx;
+        if (name[0] != '_') continue;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(name + 1, names[j]) == 0) return YES;
+        }
+    }
+    return NO;
+}
+
 #pragma mark - Images
 
 static BOOL text_range(const struct mach_header_64 *header, intptr_t slide, uintptr_t *start, uintptr_t *end) {
@@ -1163,16 +2509,41 @@ BOOL guest_attach_image(pid_t pid, const char *imagePath, void *handle, const ch
         if (g) {
             g->textStart = start;
             g->textEnd = end;
+            g->header = header;
+            g->slide = slide;
             g->handle = handle;
             if (instancePath) strlcpy(g->instancePath, instancePath, sizeof(g->instancePath));
+            guest_open_stdio_locked(g);
         }
         os_unfair_lock_unlock(&guest_lock);
         if (!g) return NO;
+
+        // A program that forks but never starts a thread, like a shell, may
+        // run its own code in the child, which must not change the parent's
+        // memory.
+        static const char *const forks[] = { "fork", "vfork" };
+        static const char *const threads[] = { "pthread_create" };
+        if (image_imports(header, slide, forks, 2) && !image_imports(header, slide, threads, 1)) {
+            guest_heap *heap = guest_heap_create();
+            os_unfair_lock_lock(&guest_lock);
+            if (!g->heap) {
+                g->heap = heap;
+                heap = NULL;
+            }
+            os_unfair_lock_unlock(&guest_lock);
+            if (heap) guest_heap_destroy(heap);
+        }
 
         struct rebinding rebindings[] = {
             { "fork", (void *)guest_fork_hook, NULL },
             { "vfork", (void *)guest_fork_hook, NULL },
             { "execve", (void *)hook_execve, NULL },
+            { "execv", (void *)hook_execv, NULL },
+            { "execvp", (void *)hook_execvp, NULL },
+            { "execvP", (void *)hook_execvP, NULL },
+            { "execl", (void *)hook_execl, NULL },
+            { "execle", (void *)hook_execle, NULL },
+            { "execlp", (void *)hook_execlp, NULL },
             { "exit", (void *)hook_exit, NULL },
             { "_exit", (void *)hook_exit, NULL },
             { "wait4", (void *)hook_wait4, NULL },
@@ -1181,6 +2552,7 @@ BOOL guest_attach_image(pid_t pid, const char *imagePath, void *handle, const ch
             { "raise", (void *)hook_raise, NULL },
             { "sigaction", (void *)hook_sigaction, NULL },
             { "getpid", (void *)hook_getpid, NULL },
+            { "getppid", (void *)hook_getppid, NULL },
             { "setsid", (void *)hook_setsid, NULL },
             { "setpgid", (void *)hook_setpgid, NULL },
             { "setrlimit", (void *)hook_setrlimit, NULL },
@@ -1189,6 +2561,7 @@ BOOL guest_attach_image(pid_t pid, const char *imagePath, void *handle, const ch
             { "setgroups", (void *)hook_setgroups, NULL },
             { "chroot", (void *)hook_chroot, NULL },
             { "chdir", (void *)hook_chdir, NULL },
+            { "fchdir", (void *)hook_fchdir, NULL },
             { "close", (void *)hook_close, NULL },
             { "dup", (void *)hook_dup, NULL },
             { "dup2", (void *)hook_dup2, NULL },
@@ -1210,6 +2583,80 @@ BOOL guest_attach_image(pid_t pid, const char *imagePath, void *handle, const ch
             { "pthread_create", (void *)hook_pthread_create, NULL },
             { "mmap", (void *)hook_mmap, NULL },
             { "munmap", (void *)hook_munmap, NULL },
+            { "_NSGetArgc", (void *)hook_NSGetArgc, NULL },
+            { "_NSGetArgv", (void *)hook_NSGetArgv, NULL },
+            { "_NSGetExecutablePath", (void *)hook_NSGetExecutablePath, NULL },
+            { "_NSGetEnviron", (void *)hook_NSGetEnviron, NULL },
+            { "getprogname", (void *)hook_getprogname, NULL },
+            { "dladdr", (void *)hook_dladdr, NULL },
+            { "dlopen", (void *)hook_dlopen, NULL },
+            { "getpwuid", (void *)hook_getpwuid, NULL },
+            { "getpwnam", (void *)hook_getpwnam, NULL },
+            { "getpwuid_r", (void *)hook_getpwuid_r, NULL },
+            { "getpwnam_r", (void *)hook_getpwnam_r, NULL },
+            { "getgrgid", (void *)hook_getgrgid, NULL },
+            { "getgrnam", (void *)hook_getgrnam, NULL },
+            { "getgrgid_r", (void *)hook_getgrgid_r, NULL },
+            { "getgrnam_r", (void *)hook_getgrnam_r, NULL },
+            // Data: the program's references to these variables are pointed
+            // at its own.
+            { "environ", (void *)&g->environ, NULL },
+            { "__stdinp", (void *)&g->stdio[0], NULL },
+            { "__stdoutp", (void *)&g->stdio[1], NULL },
+            { "__stderrp", (void *)&g->stdio[2], NULL },
+            { "getenv", (void *)hook_getenv, NULL },
+            { "setenv", (void *)hook_setenv, NULL },
+            { "putenv", (void *)hook_putenv, NULL },
+            { "unsetenv", (void *)hook_unsetenv, NULL },
+            { "fclose", (void *)hook_fclose, NULL },
+            { "printf", (void *)hook_printf, NULL },
+            { "vprintf", (void *)hook_vprintf, NULL },
+            { "puts", (void *)hook_puts, NULL },
+            { "putchar", (void *)hook_putchar, NULL },
+            { "putchar_unlocked", (void *)hook_putchar_unlocked, NULL },
+            { "getchar", (void *)hook_getchar, NULL },
+            { "getchar_unlocked", (void *)hook_getchar_unlocked, NULL },
+            { "scanf", (void *)hook_scanf, NULL },
+            { "vscanf", (void *)hook_vscanf, NULL },
+            { "perror", (void *)hook_perror, NULL },
+            { "warn", (void *)hook_warn, NULL },
+            { "warnx", (void *)hook_warnx, NULL },
+            { "warnc", (void *)hook_warnc, NULL },
+            { "vwarn", (void *)hook_vwarn, NULL },
+            { "vwarnx", (void *)hook_vwarnx, NULL },
+            { "vwarnc", (void *)hook_vwarnc, NULL },
+            { "err", (void *)hook_err, NULL },
+            { "errx", (void *)hook_errx, NULL },
+            { "errc", (void *)hook_errc, NULL },
+            { "verr", (void *)hook_verr, NULL },
+            { "verrx", (void *)hook_verrx, NULL },
+            { "verrc", (void *)hook_verrc, NULL },
+            { "open", (void *)hook_open, NULL },
+            { "openat", (void *)hook_openat, NULL },
+            { "pipe", (void *)hook_pipe, NULL },
+            { "socket", (void *)hook_socket, NULL },
+            { "socketpair", (void *)hook_socketpair, NULL },
+            { "mkstemp", (void *)hook_mkstemp, NULL },
+            { "mkstemps", (void *)hook_mkstemps, NULL },
+            { "mkostemp", (void *)hook_mkostemp, NULL },
+            { "fopen", (void *)hook_fopen, NULL },
+            { "stat", (void *)hook_stat, NULL },
+            { "lstat", (void *)hook_lstat, NULL },
+            { "fstatat", (void *)hook_fstatat, NULL },
+            { "access", (void *)hook_access, NULL },
+            { "faccessat", (void *)hook_faccessat, NULL },
+            { "opendir", (void *)hook_opendir, NULL },
+            { "readlink", (void *)hook_readlink, NULL },
+            { "realpath$DARWIN_EXTSN", (void *)hook_realpath, NULL },
+            { "malloc", (void *)hook_malloc, NULL },
+            { "calloc", (void *)hook_calloc, NULL },
+            { "free", (void *)hook_free, NULL },
+            { "malloc_size", (void *)hook_malloc_size, NULL },
+            { "posix_memalign", (void *)hook_posix_memalign, NULL },
+            { "aligned_alloc", (void *)hook_aligned_alloc, NULL },
+            { "valloc", (void *)hook_valloc, NULL },
+            { "realloc", (void *)hook_realloc, NULL },
+            { "reallocf", (void *)hook_reallocf, NULL },
         };
         return rebind_symbols_image((void *)header, slide, rebindings, sizeof(rebindings) / sizeof(rebindings[0])) == 0;
     }

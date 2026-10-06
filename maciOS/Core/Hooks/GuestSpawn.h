@@ -18,6 +18,14 @@ typedef int (*guest_launcher_t)(const char *path, char * _Nullable const * _Nonn
 
 void guest_set_launcher(guest_launcher_t launcher);
 
+/// Makes the library at `path`, which a guest program dlopen()s, loadable:
+/// writes the path of a patched copy to `loadable` and returns YES, or returns
+/// NO when `path` should be opened as it is. `programImage` is the loaded
+/// copy of the program and `executablePath` its original file.
+typedef BOOL (*guest_library_loader_t)(const char *path, const char *programImage, const char *executablePath, char loadable[_Nonnull PATH_MAX]);
+
+void guest_set_library_loader(guest_library_loader_t loader);
+
 /// Allocates a pid for a program started from the terminal; it uses the
 /// app's own stdin/stdout/stderr.
 pid_t guest_register_toplevel(void);
@@ -26,6 +34,11 @@ pid_t guest_register_toplevel(void);
 /// associates it with `pid`. When the program exits, `handle` (from dlopen)
 /// is closed and `instancePath`, if given, is deleted.
 BOOL guest_attach_image(pid_t pid, const char *imagePath, void *handle, const char * _Nullable instancePath);
+
+/// What the program `pid` sees as its arguments (_NSGetArgv), environment
+/// (environ, getenv) and executable path. The arrays must stay valid while
+/// it runs.
+void guest_set_process_info(pid_t pid, int argc, char * _Nullable * _Nonnull argv, char * _Nullable * _Nonnull envp, const char *executablePath);
 
 /// Counts the calling thread, which runs the program's entry point, as one
 /// of the program's threads.

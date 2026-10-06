@@ -38,7 +38,8 @@ class MachOPatcher: Equatable {
             ("/System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio", "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"),
             ("/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia", "/System/Library/Frameworks/CoreMedia.framework/CoreMedia"),
             ("/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo", "@rpath/CoreVideo.dylib"),
-            ("/System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos", "/System/Library/Frameworks/Kerberos.framework/Kerberos"),
+            // GSS has the Kerberos functions programs use.
+            ("/System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos", "/System/Library/Frameworks/GSS.framework/GSS"),
             ("/System/Library/Frameworks/IOBluetooth.framework/Versions/A/IOBluetooth", "@executable_path/Frameworks/IOBluetooth.framework/IOBluetooth"),
             ("/System/Library/Frameworks/CoreBluetooth.framework/Versions/A/CoreBluetooth", "/System/Library/Frameworks/CoreBluetooth.framework/CoreBluetooth"),
             ("/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit", "@rpath/IOKit.dylib"),
@@ -69,7 +70,7 @@ class MachOPatcher: Equatable {
     }
     
     func patchExecutable() -> URL? {
-        guard copyOriginalFile() else { return nil }
+        guard copyOriginalSlice() else { return nil }
         
         guard convertToDylib() != nil else { return nil }
         
@@ -81,18 +82,9 @@ class MachOPatcher: Equatable {
         
         patchKnownFrameworks()
         
-        #if targetEnvironment(simulator)
-        // The simulator has no JIT-based signature bypass, so make the existing
-        // ad-hoc signature match the patched contents instead.
-        if !macho_rehash_code_signature(patchedURL.path) {
-            NSLog("Failed to rehash code signature of %@", patchedURL.path)
-        }
-        // Rewrite into a fresh inode so no state the kernel attached to the
-        // file while it was being patched is reused when it is mapped.
-        if let data = try? Data(contentsOf: patchedURL) {
-            try? data.write(to: patchedURL, options: .atomic)
-        }
-        #endif
+        guard relinkLibraries(executablePath: fileURL.path) else { return nil }
+        
+        finishPatching()
         
         return patchedURL
     }
@@ -102,21 +94,6 @@ class MachOPatcher: Equatable {
         
         newFrameworks.forEach { replacePattern($0.0, with: $0.1) }
     }
-    
-    private func copyOriginalFile() -> Bool {
-        do {
-            if FileManager.default.fileExists(atPath: patchedURL.path) {
-                try FileManager.default.removeItem(at: patchedURL)
-            }
-            let data = try Data(contentsOf: fileURL)
-            try data.write(to: patchedURL)
-            return true
-        } catch {
-            NSLog("Error copying file: \(error)")
-            return false 
-        }
-    }
-    
     
     func patchPlatform(targetPlatform: Int32) -> String? {
         if !FileManager.default.fileExists(atPath: patchedURL.path) {
@@ -501,7 +478,7 @@ class MachOPatcher: Equatable {
         let nameLength = strlen(name) + 1
         let cmdSize = MemoryLayout<dylib_command>.size + Int(rnd32(UInt32(nameLength), 8))
         
-        guard cmdSize <= freeHeaderSpace(header) else {
+        guard cmdSize <= Self.freeHeaderSpace(header) else {
             insufficientHeaderSpace = true
             return
         }
@@ -516,7 +493,7 @@ class MachOPatcher: Equatable {
     }
     
     /// Bytes available between the end of the load commands and the first section's file contents.
-    private func freeHeaderSpace(_ header: UnsafeMutablePointer<mach_header_64>) -> Int {
+    static func freeHeaderSpace(_ header: UnsafeMutablePointer<mach_header_64>) -> Int {
         let headerPtr = UnsafeMutableRawPointer(header)
         let commandsEnd = MemoryLayout<mach_header_64>.size + Int(header.pointee.sizeofcmds)
         var firstSectionOffset = Int.max
