@@ -224,6 +224,7 @@ class Execute: NSObject {
             }
         }
 
+        maciOS_trace_line("instantiate: copying \(cached.lastPathComponent)")
         // Copies have their own paths and inodes, so dyld loads them as new
         // images instead of handing back ones already running. On APFS they are clones.
         instanceCounter.lock()
@@ -238,6 +239,7 @@ class Execute: NSObject {
             try GuestLibraries.cloneDependencies(of: instance)
         } catch {
             NSLog("Failed to prepare %@: %@", url.path, String(describing: error))
+            maciOS_trace_line("instantiate: could not prepare \(url.path): \(error)")
             try? fileManager.removeItem(at: directory)
             return nil
         }

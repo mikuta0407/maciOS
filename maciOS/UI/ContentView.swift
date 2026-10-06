@@ -49,9 +49,26 @@ struct ContentView: View {
         }
     }
 
+    private static var announcedJITWait = false
+
     /// Runs a login shell from the guest root in the terminal, like Terminal.app,
     /// and a new one whenever it exits. The first one installs Homebrew (/etc/profile).
     private func startShell() {
+        #if !targetEnvironment(simulator)
+        // Guests can only be loaded with JIT: wait for a debugger (StikDebug,
+        // or scripts/device.sh jit) instead of failing to load the shell.
+        var csFlags: UInt32 = 0
+        csops(getpid(), 0, &csFlags, MemoryLayout<UInt32>.size)
+        if csFlags & UInt32(CS_DEBUGGED) == 0 {
+            if !Self.announcedJITWait {
+                Self.announcedJITWait = true
+                maciOS_trace_line("shell: waiting for JIT")
+                fputs("maciOS: waiting for JIT (attach a debugger, e.g. with StikDebug)...\n", stderr)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { startShell() }
+            return
+        }
+        #endif
         maciOS_trace_line("shell: preparing the guest root")
         Execute.prepare()
         maciOS_trace_line("shell: guest root ready")
