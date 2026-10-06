@@ -248,7 +248,10 @@ class Execute: NSObject {
             return false
         }
 
-        guard let handle = dlopen(dylibPath, RTLD_NOW | RTLD_GLOBAL) else {
+        maciOS_trace_line("run: loading \(dylibPath)")
+        let loaded = dlopen(dylibPath, RTLD_NOW | RTLD_GLOBAL)
+        maciOS_trace_line("run: loaded \((dylibPath as NSString).lastPathComponent): \(loaded != nil)")
+        guard let handle = loaded else {
             if let error = dlerror() {
                 let message = String(cString: error)
                 NSLog("Failed to load dylib: %@", message)
@@ -331,6 +334,7 @@ class Execute: NSObject {
         let thread = Thread {
             guest_adopt_current_thread(pid)
             NSLog("Executing dylib entry point...")
+            maciOS_trace_line("run: entering \(progName)")
             let status: Int32
             if let _ = lcmain {
                 status = executeEntryPoint(for: dylibPath, argc, guestArgv, guestEnvp, guestApple)

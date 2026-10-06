@@ -13,6 +13,7 @@
 #include <mach-o/dyld_images.h>
 #include <sys/syscall.h>
 #include <dirent.h>
+#include <pthread.h>
 
 #include "utils.h"
 
@@ -174,14 +175,36 @@ static bool has_txm_firmware(void) {
 // Set before the dyld hooks are, which run with dyld's lock held.
 static bool txm;
 
-// Diagnostics from inside the hooks: NSLog may take dyld's lock.
-static void hook_log(const char *format, ...) {
-    char line[256];
+// Documents/maciOS-trace.log: written straight to the file, so it keeps the
+// last step even when the app is stopped or killed right after (the stderr
+// log goes through a pipe the app itself drains). Usable inside the dyld
+// hooks, where NSLog may take dyld's lock.
+static int traceFile = -1;
+
+void maciOS_trace_start(void) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/Documents/maciOS-trace.log", home);
+    traceFile = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+}
+
+void maciOS_trace(const char *format, ...) {
+    if (traceFile < 0) return;
+    char line[512];
+    int prefix = snprintf(line, sizeof(line), "%.3f [%llx] ", CFAbsoluteTimeGetCurrent(), (unsigned long long)pthread_mach_thread_np(pthread_self()));
     va_list args;
     va_start(args, format);
-    int length = vsnprintf(line, sizeof(line), format, args);
+    int length = vsnprintf(line + prefix, sizeof(line) - prefix - 1, format, args);
     va_end(args);
-    if (length > 0) write(STDERR_FILENO, line, MIN((size_t)length, sizeof(line) - 1));
+    if (length < 0) return;
+    length = MIN(length, (int)(sizeof(line) - prefix - 2));
+    line[prefix + length] = '\n';
+    write(traceFile, line, prefix + length + 1);
+}
+
+void maciOS_trace_line(const char *line) {
+    maciOS_trace("%s", line);
 }
 
 static void* common_hooked_mmap(mmap_p orig, void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
@@ -189,10 +212,11 @@ static void* common_hooked_mmap(mmap_p orig, void *addr, size_t len, int prot, i
     if (map == MAP_FAILED && fd && (prot & PROT_EXEC)) {
         
         map = __mmap(addr, len, prot, flags | MAP_PRIVATE | MAP_ANON, 0, 0);
+        maciOS_trace("dyld mmap: fd %d, 0x%zx bytes at %p (txm %d)", fd, len, map, txm);
         if (txm) {
             BreakMarkJITMapping((vm_address_t)map, len);
+            maciOS_trace("dyld mmap: debugger prepared %p", map);
         }
-        hook_log("[DyldLVBypass] mapped %zu bytes at %p for fd %d (txm %d)\n", len, map, fd, txm);
         
         void *memoryLoadedFile = __mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, offset);
         // mirror `addr` (rx, JIT applied) to `mirrored` (rw)
@@ -205,7 +229,7 @@ static void* common_hooked_mmap(mmap_p orig, void *addr, size_t len, int prot, i
             memcpy((void*)mirrored, memoryLoadedFile, len);
             vm_deallocate(mach_task_self(), mirrored, len);
         } else {
-            hook_log("[DyldLVBypass] vm_remap of %p failed: %d\n", map, ret);
+            maciOS_trace("dyld mmap: vm_remap of %p failed: %d", map, ret);
         }
         munmap(memoryLoadedFile, len);
     }
@@ -263,7 +287,9 @@ void init_bypassDyldLibValidation(void) {
 
     bool inDeviceTree = has_txm_in_device_tree(), firmware = has_txm_firmware();
     txm = inDeviceTree || firmware;
-    NSLog(@"[DyldLVBypass] init (TXM: device tree %d, firmware %d)", inDeviceTree, firmware);
+    uint32_t csFlags = 0;
+    csops(getpid(), 0, &csFlags, sizeof(csFlags));
+    maciOS_trace("dyld bypass: TXM device tree %d, firmware %d; CS_DEBUGGED %d", inDeviceTree, firmware, (csFlags & CS_DEBUGGED) != 0);
     
     // Modifying exec page during execution may cause SIGBUS, so ignore it now
     // Only comment this out if only one thread (main) is running
@@ -272,4 +298,5 @@ void init_bypassDyldLibValidation(void) {
     char *dyldBase = getDyldBase();
     searchAndPatch("dyld_mmap", dyldBase, mmapSig, sizeof(mmapSig), hooked_dyld_mmap, NULL);
     searchAndPatch("dyld_fcntl", dyldBase, fcntlSig, sizeof(fcntlSig), hooked_dyld_fcntl, NULL);
+    maciOS_trace("dyld bypass: hooks set");
 }

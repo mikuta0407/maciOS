@@ -17,6 +17,8 @@
 #include <stdlib.h>
 
 #include "fishhook/fishhook.h"
+
+extern void maciOS_trace(const char *format, ...);
 #include "mach_excServer.h"
 
 #import <Foundation/Foundation.h>
@@ -190,6 +192,7 @@ kern_return_t catch_mach_exception_raise_state( mach_port_t exception_port, exce
         }
     }
 
+    maciOS_trace("ellekit: breakpoint exception at pc %p is not a hook; passing it on", (void *)arm_thread_state64_get_pc(*old));
     return KERN_FAILURE;
 }
 

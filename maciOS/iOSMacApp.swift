@@ -19,6 +19,14 @@ struct maciOSApp: App {
         // On a device NSLog only reaches the system log; send it to stderr too,
         // so it shows in the app logs and Documents/maciOS.log.
         setenv("CFLOG_FORCE_STDERR", "1", 1)
+        maciOS_trace_start()
+        maciOS_trace_line("app: started")
+        // Before any view appears: the terminal's shell is loaded from
+        // ContentView's onAppear, which runs before this scene's.
+        setenv("LC_HOME_PATH", getenv("HOME"), 1)
+        #if !targetEnvironment(simulator)
+        init_bypassDyldLibValidation()
+        #endif
     }
     
     var body: some Scene {
@@ -44,10 +52,7 @@ struct maciOSApp: App {
                     }
                 }
                 .onAppear {
-                    setenv("LC_HOME_PATH", getenv("HOME"), 1)
-                    #if !targetEnvironment(simulator)
-                    init_bypassDyldLibValidation()
-                    #endif
+                    maciOS_trace_line("app: window appeared")
                     
                     let binURL = URL.documentsDirectory.appendingPathComponent("bin")
                     try? FileManager.default.createDirectory(at: binURL, withIntermediateDirectories: false)

@@ -52,7 +52,9 @@ struct ContentView: View {
     /// Runs a login shell from the guest root in the terminal, like Terminal.app,
     /// and a new one whenever it exits. The first one installs Homebrew (/etc/profile).
     private func startShell() {
+        maciOS_trace_line("shell: preparing the guest root")
         Execute.prepare()
+        maciOS_trace_line("shell: guest root ready")
         let bash = Execute.rootDirectory.appendingPathComponent("bin/bash")
         guard FileManager.default.fileExists(atPath: bash.path) else {
             NSLog("No guest root at %@; not starting a shell", Execute.rootDirectory.path)
