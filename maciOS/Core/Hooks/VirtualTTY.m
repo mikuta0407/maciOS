@@ -4,6 +4,7 @@
 //
 
 #import "VirtualTTY.h"
+#include <stdatomic.h>
 #import "../JIT/ellekit/fishhook/fishhook.h"
 
 #include <fcntl.h>
@@ -363,13 +364,23 @@ static int hook_tcsetattr(int fd, int action, const struct termios *t) {
     return orig_tcsetattr(fd, action, t);
 }
 
+// The terminal's foreground process group, as a shell with job control set
+// it. Guests have no real process groups, so it is only remembered.
+static _Atomic pid_t vtty_foreground_pgrp;
+
 static pid_t hook_tcgetpgrp(int fd) {
-    if (vtty_is_tty_fd(fd)) return getpgrp();
+    if (vtty_is_tty_fd(fd)) {
+        pid_t pgrp = vtty_foreground_pgrp;
+        return pgrp ? pgrp : getpgrp();
+    }
     return orig_tcgetpgrp(fd);
 }
 
 static int hook_tcsetpgrp(int fd, pid_t pgrp) {
-    if (vtty_is_tty_fd(fd)) return 0;
+    if (vtty_is_tty_fd(fd)) {
+        vtty_foreground_pgrp = pgrp;
+        return 0;
+    }
     return orig_tcsetpgrp(fd, pgrp);
 }
 

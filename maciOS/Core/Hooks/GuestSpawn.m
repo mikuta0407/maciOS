@@ -22,6 +22,7 @@
 #include <dlfcn.h>
 #include <grp.h>
 #include <pwd.h>
+#include <removefile.h>
 #include <err.h>
 #include <malloc/malloc.h>
 #include <spawn.h>
@@ -64,6 +65,8 @@ typedef struct {
     int waitStatus;
     char instancePath[PATH_MAX];
     void *handle;           // from dlopen, closed once the program is gone
+    void **opened;          // what the program dlopen()ed and has not closed
+    int openedCount, openedCapacity;
     thread_act_t *threads;  // threads the program started, so they can be stopped
     int threadCount, threadCapacity;
     struct region { uintptr_t start, end; } *regions;  // memory it mapped
@@ -74,7 +77,7 @@ typedef struct {
     char **argv;
     char executablePath[PATH_MAX];
     char **environ;         // what the program's environ and getenv() see
-    BOOL environOwned;      // environ was allocated by setenv() here
+    char **ownedEnviron;    // the last environment setenv() here allocated; the program may have replaced it
     FILE *stdio[3];         // the program's stdin, stdout and stderr
     guest_heap *heap;       // for programs that fork without threads; see GuestHeap.h
     char cwd[PATH_MAX];     // its working directory; each of its threads has it as its own
@@ -91,6 +94,7 @@ static pid_t guest_next_pid = GUEST_PID_BASE;
 static int guest_remapped_count;
 static guest_launcher_t guest_launcher;
 static guest_library_loader_t guest_library_loader;
+static guest_exit_observer_t guest_toplevel_exit_observer;
 // The program a thread belongs to.
 static pthread_key_t guest_thread_key;
 
@@ -101,14 +105,20 @@ int pthread_fchdir_np(int fd);
 
 static BOOL in_system_call(uintptr_t pc);
 static void guest_flush_stdio(pid_t pid);
+static void guest_hook_libraries(guest_process *owner);
+
+void guest_set_toplevel_exit_observer(guest_exit_observer_t observer) {
+    guest_toplevel_exit_observer = observer;
+}
 
 void guest_set_library_loader(guest_library_loader_t loader) {
     guest_library_loader = loader;
 }
 
 void guest_set_launcher(guest_launcher_t launcher) {
-    guest_launcher = launcher;
+    // The key first: guest_find_address_locked uses it once there is a launcher.
     pthread_key_create(&guest_thread_key, NULL);
+    guest_launcher = launcher;
     // Resolve it now rather than during a teardown, under guest_lock.
     in_system_call(0);
 }
@@ -119,7 +129,7 @@ static guest_process *guest_alloc_locked(BOOL spawned) {
         if (g->used && !(g->exited && g->reaped)) continue;
         free(g->threads);
         free(g->regions);
-        if (g->environOwned) free(g->environ);
+        free(g->ownedEnviron);
         for (int fd = 0; fd < 3; fd++) {
             if (g->stdio[fd]) fclose(g->stdio[fd]);
         }
@@ -140,12 +150,16 @@ static guest_process *guest_find_pid_locked(pid_t pid) {
     return NULL;
 }
 
+/// The program whose code is at `address`. Code outside every program's own
+/// image, such as a library one loaded, acts for the program whose thread
+/// runs it.
 static guest_process *guest_find_address_locked(uintptr_t address) {
     for (int i = 0; i < GUEST_MAX; i++) {
         guest_process *g = &guests[i];
         if (g->used && address >= g->textStart && address < g->textEnd) return g;
     }
-    return NULL;
+    guest_process *g = guest_launcher ? pthread_getspecific(guest_thread_key) : NULL;
+    return g && g->used ? g : NULL;
 }
 
 static void guest_set_fds_locked(guest_process *g, const int fds[3]) {
@@ -165,6 +179,24 @@ static void guest_close_fds_locked(guest_process *g) {
     }
 }
 
+/// Deletes a program's loaded copy. One in its own directory under
+/// GuestInstances goes with that directory, which holds the libraries cloned
+/// for it (see Execute.instantiate).
+static void guest_remove_instance(const char *path) {
+    static const char container[] = "/GuestInstances/";
+    char directory[PATH_MAX];
+    strlcpy(directory, path, sizeof(directory));
+    char *slash = strrchr(directory, '/');
+    const char *found = strstr(directory, container);
+    if (slash && found && slash > found + sizeof(container) - 1 &&
+        !memchr(found + sizeof(container) - 1, '/', (size_t)(slash - (found + sizeof(container) - 1)))) {
+        *slash = '\0';
+        removefile(directory, NULL, REMOVEFILE_RECURSIVE);
+        return;
+    }
+    unlink(path);
+}
+
 static void guest_mark_exited_locked(guest_process *g, int waitStatus) {
     if (g->exited) return;
     NSLog(@"Guest process %d exited with wait status %#x", g->pid, waitStatus);
@@ -174,9 +206,10 @@ static void guest_mark_exited_locked(guest_process *g, int waitStatus) {
         g->remapped = NO;
         guest_remapped_count--;
     }
-    if (g->instancePath[0]) unlink(g->instancePath);
+    if (g->instancePath[0]) guest_remove_instance(g->instancePath);
     g->exited = YES;
     g->waitStatus = waitStatus;
+    if (!g->spawned && guest_toplevel_exit_observer) guest_toplevel_exit_observer(g->pid, waitStatus);
     // Nobody will wait for a program started from the terminal, or an orphan.
     if (!g->spawned || g->ppid == 0) g->reaped = YES;
     for (int i = 0; i < GUEST_MAX; i++) {
@@ -202,6 +235,21 @@ static BOOL grow(void **items, int *capacity, int count, size_t size) {
     *items = grown;
     *capacity = newCapacity;
     return YES;
+}
+
+/// Takes the libraries a program dlopen()ed, to be closed once it is gone
+/// (guest_close_opened), as its exit would.
+static void **guest_take_opened_locked(guest_process *g, int *count) {
+    void **opened = g->opened;
+    *count = g->openedCount;
+    g->opened = NULL;
+    g->openedCount = g->openedCapacity = 0;
+    return opened;
+}
+
+static void guest_close_opened(void **opened, int count) {
+    for (int i = count - 1; i >= 0; i--) dlclose(opened[i]);
+    free(opened);
 }
 
 static void guest_add_thread_locked(guest_process *g, thread_act_t thread) {
@@ -374,11 +422,28 @@ void guest_adopt_current_thread(pid_t pid) {
 void guest_entry_returned(pid_t pid, int status) {
     // As exit() would; the program's output may still be buffered.
     guest_flush_stdio(pid);
+    void *handle = NULL;
+    void **opened = NULL;
+    int openedCount = 0;
+    guest_heap *heap = NULL;
     os_unfair_lock_lock(&guest_lock);
     guest_process *g = guest_find_pid_locked(pid);
-    if (g) guest_mark_exited_locked(g, W_EXITCODE(status & 0xff, 0));
+    if (g) {
+        guest_mark_exited_locked(g, W_EXITCODE(status & 0xff, 0));
+        if (guest_teardown_locked(g)) {
+            handle = g->handle;
+            opened = guest_take_opened_locked(g, &openedCount);
+            heap = g->heap;
+            g->heap = NULL;
+        }
+        g->handle = NULL;
+    }
     os_unfair_lock_unlock(&guest_lock);
+    if (heap) guest_heap_destroy(heap);
     guest_notify_exit();
+    // As in guest_exit_current: unloads the program and the libraries cloned for it.
+    if (handle) dlclose(handle);
+    guest_close_opened(opened, openedCount);
 }
 
 /// Maps a guest's stdin/stdout/stderr to the descriptors it was started with.
@@ -417,11 +482,14 @@ static void guest_exit_current(uintptr_t caller, int waitStatus) {
     // Put the app's back before the handlers' memory goes away.
     if (!g || !g->spawned) guest_restore_signal_handlers();
     void *handle = NULL;
+    void **opened = NULL;
+    int openedCount = 0;
     guest_heap *heap = NULL;
     if (g) {
         guest_mark_exited_locked(g, waitStatus);
         if (guest_teardown_locked(g)) {
             handle = g->handle;
+            opened = guest_take_opened_locked(g, &openedCount);
             heap = g->heap;
             g->heap = NULL;
         }
@@ -433,6 +501,7 @@ static void guest_exit_current(uintptr_t caller, int waitStatus) {
     // Nothing runs the program's code any more, apart from this thread, which
     // will not return into it.
     if (handle) dlclose(handle);
+    guest_close_opened(opened, openedCount);
     pthread_exit(NULL);
 }
 
@@ -829,10 +898,10 @@ static void child_take_stdio(vfork_ctx *c, int out[3]) {
             out[i] = e->real;
             *e = (child_fd){ CHILD_FD_CLOSED, -1, -1 };
         } else if (e->state == CHILD_FD_INHERITED) {
+            // A copy, as fork() would give: the parent may point its own
+            // descriptor elsewhere afterwards (a shell redirecting a builtin).
             int real = child_resolve(c, i);
-            if (real == i) {
-                out[i] = -1;
-            } else if (real >= 0) {
+            if (real >= 0) {
                 int copy = fcntl(real, F_DUPFD_CLOEXEC, 0);
                 if (copy >= 0) out[i] = copy;
             }
@@ -1034,6 +1103,8 @@ static int exec_replace(uintptr_t caller, const char *path, char *const argv[], 
     g->textStart = g->textEnd = 0;
     g->header = NULL;
     g->handle = NULL;
+    g->opened = NULL;
+    g->openedCount = g->openedCapacity = 0;
     g->heap = NULL;
     g->instancePath[0] = '\0';
     os_unfair_lock_unlock(&guest_lock);
@@ -1053,6 +1124,9 @@ static int exec_replace(uintptr_t caller, const char *path, char *const argv[], 
         g->textEnd = old.textEnd;
         g->header = old.header;
         g->handle = old.handle;
+        g->opened = old.opened;
+        g->openedCount = old.openedCount;
+        g->openedCapacity = old.openedCapacity;
         g->heap = old.heap;
         strlcpy(g->instancePath, old.instancePath, sizeof(g->instancePath));
         os_unfair_lock_unlock(&guest_lock);
@@ -1065,9 +1139,10 @@ static int exec_replace(uintptr_t caller, const char *path, char *const argv[], 
     os_unfair_lock_unlock(&guest_lock);
     free(old.threads);
     free(old.regions);
-    if (old.instancePath[0]) unlink(old.instancePath);
+    if (old.instancePath[0]) guest_remove_instance(old.instancePath);
     // This thread never returns into the old program's code.
     if (stopped && old.handle) dlclose(old.handle);
+    if (stopped) guest_close_opened(old.opened, old.openedCount);
     if (stopped && old.heap) guest_heap_destroy(old.heap);
     pthread_exit(NULL);
 }
@@ -1186,22 +1261,38 @@ static int hook_execlp(const char *file, const char *arg0, ...) {
     return exec_search(caller, file, NULL, argv_, guest_current_environ(caller));
 }
 
+/// Ends the calling program (or forked child) with `waitStatus`.
 __attribute__((noreturn))
-static void guest_exit_with(uintptr_t caller, int status) {
+static void guest_end(uintptr_t caller, int waitStatus) {
     vfork_ctx *c = child_ctx();
     if (c) {
         // The child's output is still in the parent program's stdio buffers.
         guest_flush_stdio(c->programPid);
         os_unfair_lock_lock(&guest_lock);
         guest_process *g = guest_find_pid_locked(c->pid);
-        if (g) guest_mark_exited_locked(g, W_EXITCODE(status & 0xff, 0));
+        if (g) guest_mark_exited_locked(g, waitStatus);
         os_unfair_lock_unlock(&guest_lock);
         guest_notify_exit();
         child_finish(c);
     }
     pid_t pid = guest_pid_at(caller);
     if (pid) guest_flush_stdio(pid);
-    guest_exit_current(caller, W_EXITCODE(status & 0xff, 0));
+    guest_exit_current(caller, waitStatus);
+}
+
+__attribute__((noreturn))
+static void guest_exit_with(uintptr_t caller, int status) {
+    guest_end(caller, W_EXITCODE(status & 0xff, 0));
+}
+
+/// A program that aborts dies of SIGABRT, as far as its parent can tell,
+/// instead of leaving it waiting.
+__attribute__((noreturn))
+static void hook_abort(void) {
+    uintptr_t caller = CALLER;
+    if (!child_ctx() && !guest_pid_at(caller)) abort();
+    NSLog(@"A guest called abort()");
+    guest_end(caller, SIGABRT);
 }
 
 __attribute__((noreturn))
@@ -1298,13 +1389,34 @@ static int hook_raise(int sig) {
     return raise(sig);
 }
 
+// SIGPIPE stays ignored for the whole process: one guest writing to a closed
+// pipe must not take the app and every other guest down. Guests get EPIPE,
+// and see the disposition they asked for.
+static struct sigaction guest_sigpipe_action = { .sa_handler = SIG_DFL };
+static os_unfair_lock guest_sigpipe_lock = OS_UNFAIR_LOCK_INIT;
+
 static int hook_sigaction(int sig, const struct sigaction *act, struct sigaction *oact) {
+    BOOL mayChange = !child_ctx() && !(act && guest_is_spawned(CALLER));
+    if (sig == SIGPIPE) {
+        os_unfair_lock_lock(&guest_sigpipe_lock);
+        if (oact) *oact = guest_sigpipe_action;
+        if (act && mayChange) guest_sigpipe_action = *act;
+        os_unfair_lock_unlock(&guest_sigpipe_lock);
+        return 0;
+    }
     // Handlers are process-wide. A forked child must not clear its parent's,
     // and a program started by another guest must not replace them.
-    if (child_ctx() || (act && guest_is_spawned(CALLER))) {
+    if (!mayChange) {
         return oact ? sigaction(sig, NULL, oact) : 0;
     }
     return sigaction(sig, act, oact);
+}
+
+static void (*hook_signal(int sig, void (*handler)(int)))(int) {
+    if (sig != SIGPIPE) return signal(sig, handler);
+    struct sigaction act = { .sa_handler = handler }, old;
+    hook_sigaction(sig, &act, &old);
+    return old.sa_handler;
 }
 
 static pid_t hook_getpid(void) {
@@ -1329,8 +1441,12 @@ static pid_t hook_setsid(void) {
     return c ? c->pid : setsid();
 }
 
+/// Guests share the app's process group and cannot leave it; a shell setting
+/// up job control is told it succeeded.
 static int hook_setpgid(pid_t pid, pid_t pgid) {
-    return child_ctx() ? 0 : setpgid(pid, pgid);
+    if (child_ctx()) return 0;
+    int result = setpgid(pid, pgid);
+    return result != 0 && errno == EPERM ? 0 : result;
 }
 
 static int hook_setrlimit(int resource, const struct rlimit *rlp) {
@@ -1637,7 +1753,7 @@ void guest_set_process_info(pid_t pid, int argc, char **argv, char **envp, const
         // The old program's threads may still be reading the previous array
         // after an exec, so it is not freed.
         g->environ = envp;
-        g->environOwned = NO;
+        g->ownedEnviron = NULL;
     }
     fallback_argc = argc;
     fallback_argv = argv;
@@ -1684,14 +1800,14 @@ static char ***hook_NSGetEnviron(void) {
     return result;
 }
 
-/// Opens a patched copy of a library a program loads itself, such as a Ruby
-/// extension: built for macOS, the original cannot be loaded here.
-static void *hook_dlopen(const char *path, int mode) {
+/// dlopen() for the program whose code is at `caller`, of a loadable copy
+/// if `path` is a library built for macOS.
+static void *guest_dlopen(uintptr_t caller, const char *path, int mode) {
     if (!path || !guest_library_loader) return dlopen(path, mode);
     char executablePath[PATH_MAX] = "";
     const void *header = NULL;
     os_unfair_lock_lock(&guest_lock);
-    guest_process *g = guest_find_address_locked(CALLER);
+    guest_process *g = guest_find_address_locked(caller);
     if (g) {
         header = g->header;
         strlcpy(executablePath, g->executablePath, sizeof(executablePath));
@@ -1704,9 +1820,45 @@ static void *hook_dlopen(const char *path, int mode) {
     const char *mapped = guest_root_map(path, buffer);
     char loadable[PATH_MAX];
     if (mapped[0] == '/' && guest_library_loader(mapped, programImage, executablePath, loadable)) {
-        return dlopen(loadable, mode);
+        void *handle = dlopen(loadable, mode);
+        if (handle) {
+            os_unfair_lock_lock(&guest_lock);
+            guest_process *owner = guest_find_address_locked(caller);
+            os_unfair_lock_unlock(&guest_lock);
+            guest_hook_libraries(owner);
+        }
+        return handle;
     }
     return dlopen(path, mode);
+}
+
+/// Opens a patched copy of a library a program loads itself, such as a Ruby
+/// extension: built for macOS, the original cannot be loaded here. What it
+/// opens is closed when it exits.
+static void *hook_dlopen(const char *path, int mode) {
+    uintptr_t caller = CALLER;
+    void *handle = guest_dlopen(caller, path, mode);
+    if (!handle || !path) return handle;
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(caller);
+    if (g && grow((void **)&g->opened, &g->openedCapacity, g->openedCount, sizeof(void *))) {
+        g->opened[g->openedCount++] = handle;
+    }
+    os_unfair_lock_unlock(&guest_lock);
+    return handle;
+}
+
+static int hook_dlclose(void *handle) {
+    os_unfair_lock_lock(&guest_lock);
+    guest_process *g = guest_find_address_locked(CALLER);
+    for (int i = g ? g->openedCount - 1 : -1; i >= 0; i--) {
+        if (g->opened[i] != handle) continue;
+        memmove(&g->opened[i], &g->opened[i + 1], (size_t)(g->openedCount - i - 1) * sizeof(void *));
+        g->openedCount--;
+        break;
+    }
+    os_unfair_lock_unlock(&guest_lock);
+    return dlclose(handle);
 }
 
 /// For an address in a program's own image, names the program's file rather
@@ -1894,7 +2046,7 @@ static int env_put_locked(guest_process *g, char *entry, size_t nameLength) {
     if (!replaced) next[used++] = entry;
     next[used] = NULL;
     g->environ = next;
-    g->environOwned = YES;
+    g->ownedEnviron = next;
     return 0;
 }
 
@@ -1987,7 +2139,7 @@ static int hook_unsetenv(const char *name) {
             }
             next[used] = NULL;
             g->environ = next;
-            g->environOwned = YES;
+            g->ownedEnviron = next;
         }
     }
     os_unfair_lock_unlock(&guest_lock);
@@ -2488,6 +2640,291 @@ static BOOL text_range(const struct mach_header_64 *header, intptr_t slide, uint
     return NO;
 }
 
+#define GUEST_COUNT(array) (sizeof(array) / sizeof((array)[0]))
+
+/// What a program's calls go to, in its own image and in the libraries it uses.
+static struct rebinding guest_function_hooks[] = {
+    { "fork", (void *)guest_fork_hook, NULL },
+    { "vfork", (void *)guest_fork_hook, NULL },
+    { "execve", (void *)hook_execve, NULL },
+    { "execv", (void *)hook_execv, NULL },
+    { "execvp", (void *)hook_execvp, NULL },
+    { "execvP", (void *)hook_execvP, NULL },
+    { "execl", (void *)hook_execl, NULL },
+    { "execle", (void *)hook_execle, NULL },
+    { "execlp", (void *)hook_execlp, NULL },
+    { "exit", (void *)hook_exit, NULL },
+    { "_exit", (void *)hook_exit, NULL },
+    { "abort", (void *)hook_abort, NULL },
+    { "wait4", (void *)hook_wait4, NULL },
+    { "waitpid", (void *)hook_waitpid, NULL },
+    { "kill", (void *)hook_kill, NULL },
+    { "raise", (void *)hook_raise, NULL },
+    { "sigaction", (void *)hook_sigaction, NULL },
+    { "signal", (void *)hook_signal, NULL },
+    { "getpid", (void *)hook_getpid, NULL },
+    { "getppid", (void *)hook_getppid, NULL },
+    { "setsid", (void *)hook_setsid, NULL },
+    { "setpgid", (void *)hook_setpgid, NULL },
+    { "setrlimit", (void *)hook_setrlimit, NULL },
+    { "setgid", (void *)hook_setgid, NULL },
+    { "setuid", (void *)hook_setuid, NULL },
+    { "setgroups", (void *)hook_setgroups, NULL },
+    { "chroot", (void *)hook_chroot, NULL },
+    { "chdir", (void *)hook_chdir, NULL },
+    { "fchdir", (void *)hook_fchdir, NULL },
+    { "close", (void *)hook_close, NULL },
+    { "dup", (void *)hook_dup, NULL },
+    { "dup2", (void *)hook_dup2, NULL },
+    { "fcntl", (void *)hook_fcntl, NULL },
+    { "ioctl", (void *)hook_ioctl, NULL },
+    { "read", (void *)hook_read, NULL },
+    { "write", (void *)hook_write, NULL },
+    { "pread", (void *)hook_pread, NULL },
+    { "pwrite", (void *)hook_pwrite, NULL },
+    { "readv", (void *)hook_readv, NULL },
+    { "writev", (void *)hook_writev, NULL },
+    { "lseek", (void *)hook_lseek, NULL },
+    { "fstat", (void *)hook_fstat, NULL },
+    { "fsync", (void *)hook_fsync, NULL },
+    { "ftruncate", (void *)hook_ftruncate, NULL },
+    { "isatty", (void *)hook_isatty, NULL },
+    { "tcgetattr", (void *)hook_tcgetattr, NULL },
+    { "tcsetattr", (void *)hook_tcsetattr, NULL },
+    { "pthread_create", (void *)hook_pthread_create, NULL },
+    { "mmap", (void *)hook_mmap, NULL },
+    { "munmap", (void *)hook_munmap, NULL },
+    { "_NSGetArgc", (void *)hook_NSGetArgc, NULL },
+    { "_NSGetArgv", (void *)hook_NSGetArgv, NULL },
+    { "_NSGetExecutablePath", (void *)hook_NSGetExecutablePath, NULL },
+    { "_NSGetEnviron", (void *)hook_NSGetEnviron, NULL },
+    { "getprogname", (void *)hook_getprogname, NULL },
+    { "dladdr", (void *)hook_dladdr, NULL },
+    { "dlopen", (void *)hook_dlopen, NULL },
+    { "dlclose", (void *)hook_dlclose, NULL },
+    { "getpwuid", (void *)hook_getpwuid, NULL },
+    { "getpwnam", (void *)hook_getpwnam, NULL },
+    { "getpwuid_r", (void *)hook_getpwuid_r, NULL },
+    { "getpwnam_r", (void *)hook_getpwnam_r, NULL },
+    { "getgrgid", (void *)hook_getgrgid, NULL },
+    { "getgrnam", (void *)hook_getgrnam, NULL },
+    { "getgrgid_r", (void *)hook_getgrgid_r, NULL },
+    { "getgrnam_r", (void *)hook_getgrnam_r, NULL },
+    { "getenv", (void *)hook_getenv, NULL },
+    { "setenv", (void *)hook_setenv, NULL },
+    { "putenv", (void *)hook_putenv, NULL },
+    { "unsetenv", (void *)hook_unsetenv, NULL },
+    { "fclose", (void *)hook_fclose, NULL },
+    { "printf", (void *)hook_printf, NULL },
+    { "vprintf", (void *)hook_vprintf, NULL },
+    { "puts", (void *)hook_puts, NULL },
+    { "putchar", (void *)hook_putchar, NULL },
+    { "putchar_unlocked", (void *)hook_putchar_unlocked, NULL },
+    { "getchar", (void *)hook_getchar, NULL },
+    { "getchar_unlocked", (void *)hook_getchar_unlocked, NULL },
+    { "scanf", (void *)hook_scanf, NULL },
+    { "vscanf", (void *)hook_vscanf, NULL },
+    { "perror", (void *)hook_perror, NULL },
+    { "warn", (void *)hook_warn, NULL },
+    { "warnx", (void *)hook_warnx, NULL },
+    { "warnc", (void *)hook_warnc, NULL },
+    { "vwarn", (void *)hook_vwarn, NULL },
+    { "vwarnx", (void *)hook_vwarnx, NULL },
+    { "vwarnc", (void *)hook_vwarnc, NULL },
+    { "err", (void *)hook_err, NULL },
+    { "errx", (void *)hook_errx, NULL },
+    { "errc", (void *)hook_errc, NULL },
+    { "verr", (void *)hook_verr, NULL },
+    { "verrx", (void *)hook_verrx, NULL },
+    { "verrc", (void *)hook_verrc, NULL },
+    { "open", (void *)hook_open, NULL },
+    { "openat", (void *)hook_openat, NULL },
+    { "pipe", (void *)hook_pipe, NULL },
+    { "socket", (void *)hook_socket, NULL },
+    { "socketpair", (void *)hook_socketpair, NULL },
+    { "mkstemp", (void *)hook_mkstemp, NULL },
+    { "mkstemps", (void *)hook_mkstemps, NULL },
+    { "mkostemp", (void *)hook_mkostemp, NULL },
+    { "fopen", (void *)hook_fopen, NULL },
+    { "stat", (void *)hook_stat, NULL },
+    { "lstat", (void *)hook_lstat, NULL },
+    { "fstatat", (void *)hook_fstatat, NULL },
+    { "access", (void *)hook_access, NULL },
+    { "faccessat", (void *)hook_faccessat, NULL },
+    { "opendir", (void *)hook_opendir, NULL },
+    { "readlink", (void *)hook_readlink, NULL },
+    { "realpath$DARWIN_EXTSN", (void *)hook_realpath, NULL },
+};
+
+/// Allocation goes to the program's private heap, if it has one (see
+/// GuestHeap.h). Only its own image's: libraries are shared by programs and
+/// keep what they allocate past any one program's heap.
+static struct rebinding guest_heap_hooks[] = {
+    { "malloc", (void *)hook_malloc, NULL },
+    { "calloc", (void *)hook_calloc, NULL },
+    { "free", (void *)hook_free, NULL },
+    { "malloc_size", (void *)hook_malloc_size, NULL },
+    { "posix_memalign", (void *)hook_posix_memalign, NULL },
+    { "aligned_alloc", (void *)hook_aligned_alloc, NULL },
+    { "valloc", (void *)hook_valloc, NULL },
+    { "realloc", (void *)hook_realloc, NULL },
+    { "reallocf", (void *)hook_reallocf, NULL },
+};
+
+#pragma mark - Libraries
+
+// A library's references to stdin, stdout and stderr are libc's own, which
+// use the app's descriptors; its calls are given the program's FILEs instead.
+static FILE *guest_file(uintptr_t caller, FILE *file) {
+    int fd = file == stdin ? 0 : file == stdout ? 1 : file == stderr ? 2 : -1;
+    return fd < 0 ? file : guest_stdio(caller, fd);
+}
+
+static char *hook_fgets(char *buffer, int size, FILE *file) { return fgets(buffer, size, guest_file(CALLER, file)); }
+static int hook_fgetc(FILE *file) { return fgetc(guest_file(CALLER, file)); }
+static int hook_getc(FILE *file) { return getc(guest_file(CALLER, file)); }
+static int hook_ungetc(int c, FILE *file) { return ungetc(c, guest_file(CALLER, file)); }
+static size_t hook_fread(void *buffer, size_t size, size_t count, FILE *file) { return fread(buffer, size, count, guest_file(CALLER, file)); }
+static size_t hook_fwrite(const void *buffer, size_t size, size_t count, FILE *file) { return fwrite(buffer, size, count, guest_file(CALLER, file)); }
+static int hook_fputs(const char *string, FILE *file) { return fputs(string, guest_file(CALLER, file)); }
+static int hook_fputc(int c, FILE *file) { return fputc(c, guest_file(CALLER, file)); }
+static int hook_putc(int c, FILE *file) { return putc(c, guest_file(CALLER, file)); }
+static int hook_vfprintf(FILE *file, const char *format, va_list args) { return vfprintf(guest_file(CALLER, file), format, args); }
+static int hook_vfscanf(FILE *file, const char *format, va_list args) { return vfscanf(guest_file(CALLER, file), format, args); }
+static int hook_fflush(FILE *file) { return fflush(file ? guest_file(CALLER, file) : NULL); }
+static ssize_t hook_getline(char **line, size_t *capacity, FILE *file) { return getline(line, capacity, guest_file(CALLER, file)); }
+static ssize_t hook_getdelim(char **line, size_t *capacity, int delimiter, FILE *file) { return getdelim(line, capacity, delimiter, guest_file(CALLER, file)); }
+static int hook_feof(FILE *file) { return feof(guest_file(CALLER, file)); }
+static int hook_ferror(FILE *file) { return ferror(guest_file(CALLER, file)); }
+static void hook_clearerr(FILE *file) { clearerr(guest_file(CALLER, file)); }
+static int hook_setvbuf(FILE *file, char *buffer, int mode, size_t size) { return setvbuf(guest_file(CALLER, file), buffer, mode, size); }
+
+static int hook_fprintf(FILE *file, const char *format, ...) {
+    FILE *own = guest_file(CALLER, file);
+    va_list args;
+    va_start(args, format);
+    int result = vfprintf(own, format, args);
+    va_end(args);
+    return result;
+}
+
+static int hook_fscanf(FILE *file, const char *format, ...) {
+    FILE *own = guest_file(CALLER, file);
+    va_list args;
+    va_start(args, format);
+    int result = vfscanf(own, format, args);
+    va_end(args);
+    return result;
+}
+
+static struct rebinding guest_library_hooks[] = {
+    { "fgets", (void *)hook_fgets, NULL },
+    { "fgetc", (void *)hook_fgetc, NULL },
+    { "getc", (void *)hook_getc, NULL },
+    { "ungetc", (void *)hook_ungetc, NULL },
+    { "fread", (void *)hook_fread, NULL },
+    { "fwrite", (void *)hook_fwrite, NULL },
+    { "fputs", (void *)hook_fputs, NULL },
+    { "fputc", (void *)hook_fputc, NULL },
+    { "putc", (void *)hook_putc, NULL },
+    { "fprintf", (void *)hook_fprintf, NULL },
+    { "vfprintf", (void *)hook_vfprintf, NULL },
+    { "fscanf", (void *)hook_fscanf, NULL },
+    { "vfscanf", (void *)hook_vfscanf, NULL },
+    { "fflush", (void *)hook_fflush, NULL },
+    { "getline", (void *)hook_getline, NULL },
+    { "getdelim", (void *)hook_getdelim, NULL },
+    { "feof", (void *)hook_feof, NULL },
+    { "ferror", (void *)hook_ferror, NULL },
+    { "clearerr", (void *)hook_clearerr, NULL },
+    { "setvbuf", (void *)hook_setvbuf, NULL },
+};
+
+/// Points an image of the program's own (its copy, and libraries cloned for
+/// it) at its allocator and its environ, stdin, stdout and stderr.
+static BOOL guest_hook_own_variables(guest_process *g, const struct mach_header_64 *header, intptr_t slide) {
+    struct rebinding variables[] = {
+        { "environ", (void *)&g->environ, NULL },
+        { "__stdinp", (void *)&g->stdio[0], NULL },
+        { "__stdoutp", (void *)&g->stdio[1], NULL },
+        { "__stderrp", (void *)&g->stdio[2], NULL },
+    };
+    return rebind_symbols_image((void *)header, slide, guest_heap_hooks, GUEST_COUNT(guest_heap_hooks)) == 0 &&
+           rebind_symbols_image((void *)header, slide, variables, GUEST_COUNT(variables)) == 0;
+}
+
+/// The directory holding a program's copy and the libraries cloned for it,
+/// with a trailing slash, if `path` is in one (see Execute.instantiate).
+static BOOL instance_directory(const char *path, char directory[PATH_MAX]) {
+    static const char container[] = "/GuestInstances/";
+    const char *found = strstr(path, container);
+    if (!found) return NO;
+    const char *slash = strchr(found + sizeof(container) - 1, '/');
+    if (!slash) return NO;
+    size_t length = (size_t)(slash - path) + 1;
+    if (length >= PATH_MAX) return NO;
+    memcpy(directory, path, length);
+    directory[length] = '\0';
+    return YES;
+}
+
+/// Installs the hooks into the patched libraries programs have loaded (they
+/// live in the app's container, unlike the system's), each once. The ones
+/// cloned for `owner` are its own and are hooked as its image is; others are
+/// shared, and their calls act for the program whose thread makes them.
+static void guest_hook_libraries(guest_process *owner) {
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static char **hooked;
+    static int hookedCount, hookedCapacity;
+    static char home[PATH_MAX];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        strlcpy(home, NSHomeDirectory().fileSystemRepresentation, sizeof(home));
+        strlcat(home, "/", sizeof(home));
+    });
+    size_t homeLength = strlen(home);
+
+    char ownDirectory[PATH_MAX] = "";
+    os_unfair_lock_lock(&guest_lock);
+    if (owner && owner->used) instance_directory(owner->instancePath, ownDirectory);
+    os_unfair_lock_unlock(&guest_lock);
+    size_t ownLength = strlen(ownDirectory);
+
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || strncmp(name, home, homeLength) != 0) continue;
+        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        BOOL program = NO;
+        os_unfair_lock_lock(&guest_lock);
+        for (int j = 0; j < GUEST_MAX && !program; j++) {
+            program = guests[j].used && guests[j].header == header;
+        }
+        os_unfair_lock_unlock(&guest_lock);
+        if (program) continue;
+        BOOL own = ownLength && strncmp(name, ownDirectory, ownLength) == 0;
+        char directory[PATH_MAX];
+        // Another program's own libraries; it hooks them.
+        if (!own && instance_directory(name, directory)) continue;
+
+        os_unfair_lock_lock(&lock);
+        BOOL done = NO;
+        for (int j = 0; j < hookedCount && !done; j++) done = strcmp(hooked[j], name) == 0;
+        if (!done && grow((void **)&hooked, &hookedCapacity, hookedCount, sizeof(char *))) {
+            hooked[hookedCount++] = strdup(name);
+        }
+        os_unfair_lock_unlock(&lock);
+        if (done) continue;
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        rebind_symbols_image((void *)header, slide, guest_function_hooks, GUEST_COUNT(guest_function_hooks));
+        if (own) {
+            guest_hook_own_variables(owner, header, slide);
+        } else {
+            rebind_symbols_image((void *)header, slide, guest_library_hooks, GUEST_COUNT(guest_library_hooks));
+        }
+    }
+}
+
 BOOL guest_attach_image(pid_t pid, const char *imagePath, void *handle, const char *instancePath) {
     char wanted[PATH_MAX];
     if (!realpath(imagePath, wanted)) strlcpy(wanted, imagePath, sizeof(wanted));
@@ -2534,131 +2971,10 @@ BOOL guest_attach_image(pid_t pid, const char *imagePath, void *handle, const ch
             if (heap) guest_heap_destroy(heap);
         }
 
-        struct rebinding rebindings[] = {
-            { "fork", (void *)guest_fork_hook, NULL },
-            { "vfork", (void *)guest_fork_hook, NULL },
-            { "execve", (void *)hook_execve, NULL },
-            { "execv", (void *)hook_execv, NULL },
-            { "execvp", (void *)hook_execvp, NULL },
-            { "execvP", (void *)hook_execvP, NULL },
-            { "execl", (void *)hook_execl, NULL },
-            { "execle", (void *)hook_execle, NULL },
-            { "execlp", (void *)hook_execlp, NULL },
-            { "exit", (void *)hook_exit, NULL },
-            { "_exit", (void *)hook_exit, NULL },
-            { "wait4", (void *)hook_wait4, NULL },
-            { "waitpid", (void *)hook_waitpid, NULL },
-            { "kill", (void *)hook_kill, NULL },
-            { "raise", (void *)hook_raise, NULL },
-            { "sigaction", (void *)hook_sigaction, NULL },
-            { "getpid", (void *)hook_getpid, NULL },
-            { "getppid", (void *)hook_getppid, NULL },
-            { "setsid", (void *)hook_setsid, NULL },
-            { "setpgid", (void *)hook_setpgid, NULL },
-            { "setrlimit", (void *)hook_setrlimit, NULL },
-            { "setgid", (void *)hook_setgid, NULL },
-            { "setuid", (void *)hook_setuid, NULL },
-            { "setgroups", (void *)hook_setgroups, NULL },
-            { "chroot", (void *)hook_chroot, NULL },
-            { "chdir", (void *)hook_chdir, NULL },
-            { "fchdir", (void *)hook_fchdir, NULL },
-            { "close", (void *)hook_close, NULL },
-            { "dup", (void *)hook_dup, NULL },
-            { "dup2", (void *)hook_dup2, NULL },
-            { "fcntl", (void *)hook_fcntl, NULL },
-            { "ioctl", (void *)hook_ioctl, NULL },
-            { "read", (void *)hook_read, NULL },
-            { "write", (void *)hook_write, NULL },
-            { "pread", (void *)hook_pread, NULL },
-            { "pwrite", (void *)hook_pwrite, NULL },
-            { "readv", (void *)hook_readv, NULL },
-            { "writev", (void *)hook_writev, NULL },
-            { "lseek", (void *)hook_lseek, NULL },
-            { "fstat", (void *)hook_fstat, NULL },
-            { "fsync", (void *)hook_fsync, NULL },
-            { "ftruncate", (void *)hook_ftruncate, NULL },
-            { "isatty", (void *)hook_isatty, NULL },
-            { "tcgetattr", (void *)hook_tcgetattr, NULL },
-            { "tcsetattr", (void *)hook_tcsetattr, NULL },
-            { "pthread_create", (void *)hook_pthread_create, NULL },
-            { "mmap", (void *)hook_mmap, NULL },
-            { "munmap", (void *)hook_munmap, NULL },
-            { "_NSGetArgc", (void *)hook_NSGetArgc, NULL },
-            { "_NSGetArgv", (void *)hook_NSGetArgv, NULL },
-            { "_NSGetExecutablePath", (void *)hook_NSGetExecutablePath, NULL },
-            { "_NSGetEnviron", (void *)hook_NSGetEnviron, NULL },
-            { "getprogname", (void *)hook_getprogname, NULL },
-            { "dladdr", (void *)hook_dladdr, NULL },
-            { "dlopen", (void *)hook_dlopen, NULL },
-            { "getpwuid", (void *)hook_getpwuid, NULL },
-            { "getpwnam", (void *)hook_getpwnam, NULL },
-            { "getpwuid_r", (void *)hook_getpwuid_r, NULL },
-            { "getpwnam_r", (void *)hook_getpwnam_r, NULL },
-            { "getgrgid", (void *)hook_getgrgid, NULL },
-            { "getgrnam", (void *)hook_getgrnam, NULL },
-            { "getgrgid_r", (void *)hook_getgrgid_r, NULL },
-            { "getgrnam_r", (void *)hook_getgrnam_r, NULL },
-            // Data: the program's references to these variables are pointed
-            // at its own.
-            { "environ", (void *)&g->environ, NULL },
-            { "__stdinp", (void *)&g->stdio[0], NULL },
-            { "__stdoutp", (void *)&g->stdio[1], NULL },
-            { "__stderrp", (void *)&g->stdio[2], NULL },
-            { "getenv", (void *)hook_getenv, NULL },
-            { "setenv", (void *)hook_setenv, NULL },
-            { "putenv", (void *)hook_putenv, NULL },
-            { "unsetenv", (void *)hook_unsetenv, NULL },
-            { "fclose", (void *)hook_fclose, NULL },
-            { "printf", (void *)hook_printf, NULL },
-            { "vprintf", (void *)hook_vprintf, NULL },
-            { "puts", (void *)hook_puts, NULL },
-            { "putchar", (void *)hook_putchar, NULL },
-            { "putchar_unlocked", (void *)hook_putchar_unlocked, NULL },
-            { "getchar", (void *)hook_getchar, NULL },
-            { "getchar_unlocked", (void *)hook_getchar_unlocked, NULL },
-            { "scanf", (void *)hook_scanf, NULL },
-            { "vscanf", (void *)hook_vscanf, NULL },
-            { "perror", (void *)hook_perror, NULL },
-            { "warn", (void *)hook_warn, NULL },
-            { "warnx", (void *)hook_warnx, NULL },
-            { "warnc", (void *)hook_warnc, NULL },
-            { "vwarn", (void *)hook_vwarn, NULL },
-            { "vwarnx", (void *)hook_vwarnx, NULL },
-            { "vwarnc", (void *)hook_vwarnc, NULL },
-            { "err", (void *)hook_err, NULL },
-            { "errx", (void *)hook_errx, NULL },
-            { "errc", (void *)hook_errc, NULL },
-            { "verr", (void *)hook_verr, NULL },
-            { "verrx", (void *)hook_verrx, NULL },
-            { "verrc", (void *)hook_verrc, NULL },
-            { "open", (void *)hook_open, NULL },
-            { "openat", (void *)hook_openat, NULL },
-            { "pipe", (void *)hook_pipe, NULL },
-            { "socket", (void *)hook_socket, NULL },
-            { "socketpair", (void *)hook_socketpair, NULL },
-            { "mkstemp", (void *)hook_mkstemp, NULL },
-            { "mkstemps", (void *)hook_mkstemps, NULL },
-            { "mkostemp", (void *)hook_mkostemp, NULL },
-            { "fopen", (void *)hook_fopen, NULL },
-            { "stat", (void *)hook_stat, NULL },
-            { "lstat", (void *)hook_lstat, NULL },
-            { "fstatat", (void *)hook_fstatat, NULL },
-            { "access", (void *)hook_access, NULL },
-            { "faccessat", (void *)hook_faccessat, NULL },
-            { "opendir", (void *)hook_opendir, NULL },
-            { "readlink", (void *)hook_readlink, NULL },
-            { "realpath$DARWIN_EXTSN", (void *)hook_realpath, NULL },
-            { "malloc", (void *)hook_malloc, NULL },
-            { "calloc", (void *)hook_calloc, NULL },
-            { "free", (void *)hook_free, NULL },
-            { "malloc_size", (void *)hook_malloc_size, NULL },
-            { "posix_memalign", (void *)hook_posix_memalign, NULL },
-            { "aligned_alloc", (void *)hook_aligned_alloc, NULL },
-            { "valloc", (void *)hook_valloc, NULL },
-            { "realloc", (void *)hook_realloc, NULL },
-            { "reallocf", (void *)hook_reallocf, NULL },
-        };
-        return rebind_symbols_image((void *)header, slide, rebindings, sizeof(rebindings) / sizeof(rebindings[0])) == 0;
+        BOOL hooked = rebind_symbols_image((void *)header, slide, guest_function_hooks, GUEST_COUNT(guest_function_hooks)) == 0 &&
+                      guest_hook_own_variables(g, header, slide);
+        guest_hook_libraries(g);
+        return hooked;
     }
     return NO;
 }

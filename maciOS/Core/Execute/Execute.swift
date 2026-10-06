@@ -5,7 +5,9 @@
 //  Created by Stossy11 on 23/08/2025.
 //
 
+import AppleArchive
 import Foundation
+import System
 import UIKit
 
 struct LCMain {
@@ -17,6 +19,8 @@ class Execute: NSObject {
 
     private static let setUp: Void = {
         install_exit_hook()
+        // Guests share the process; a write to a closed pipe gives EPIPE (see hook_sigaction).
+        signal(SIGPIPE, SIG_IGN)
         guest_set_launcher { path, argv, envp, pid in
             Execute.spawn(path: String(cString: path), argv: argv, envp: envp, pid: pid)
         }
@@ -25,38 +29,54 @@ class Execute: NSObject {
             strlcpy(loadable, result, Int(PATH_MAX))
             return true
         }
+        guest_set_toplevel_exit_observer { pid, status in
+            DispatchQueue.main.async { Execute.toplevelExited(pid: pid, status: status) }
+        }
         try? FileManager.default.removeItem(at: instanceDirectory)
         installBundledRoot()
         guest_root_set(rootDirectory.path)
         // Patched images refer to each other by absolute path, which changes
         // when the app's container moves.
+        // Also when the patched images' format changes (imageCacheFormat).
         let location = imageCacheDirectory.appendingPathComponent(".location")
-        if (try? String(contentsOf: location, encoding: .utf8)) != imageCacheDirectory.path {
+        let stamp = "\(imageCacheDirectory.path)\n\(imageCacheFormat)"
+        if (try? String(contentsOf: location, encoding: .utf8)) != stamp {
             try? FileManager.default.removeItem(at: imageCacheDirectory)
             try? FileManager.default.createDirectory(at: imageCacheDirectory, withIntermediateDirectories: true)
-            try? imageCacheDirectory.path.write(to: location, atomically: true, encoding: .utf8)
+            try? stamp.write(to: location, atomically: true, encoding: .utf8)
         }
     }()
 
     /// Stands in for /bin, /usr and /etc; see GuestRoot.h.
     static let rootDirectory = URL.documentsDirectory.appendingPathComponent("root")
 
-    /// Copies the guest root built into the app (scripts/embed-guest-root.sh)
-    /// over Documents/root when it is a different build. Files the root does
-    /// not have are left alone.
+    /// Installs the guest root built into the app (GuestRoot.aar, see
+    /// scripts/embed-guest-root.sh) over Documents/root when it is a different
+    /// build. Files the root does not have are left alone.
     private static func installBundledRoot() {
         let fileManager = FileManager.default
-        guard let bundled = Bundle.main.url(forResource: "GuestRoot", withExtension: nil) else { return }
-        let versionName = ".maciOS-root-version"
-        let version = try? String(contentsOf: bundled.appendingPathComponent(versionName), encoding: .utf8)
-        let installedVersion = try? String(contentsOf: rootDirectory.appendingPathComponent(versionName), encoding: .utf8)
-        guard let version, version != installedVersion else { return }
+        guard let archive = Bundle.main.url(forResource: "GuestRoot", withExtension: "aar"),
+              let versionURL = Bundle.main.url(forResource: "GuestRoot", withExtension: "version"),
+              let version = try? String(contentsOf: versionURL, encoding: .utf8) else { return }
+        let installedVersionURL = rootDirectory.appendingPathComponent(".maciOS-root-version")
+        guard version != (try? String(contentsOf: installedVersionURL, encoding: .utf8)) else { return }
 
-        guard let entries = fileManager.enumerator(at: bundled, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }
-        let base = bundled.standardizedFileURL.path
+        let staging = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("GuestRoot")
+        try? fileManager.removeItem(at: staging)
+        defer { try? fileManager.removeItem(at: staging) }
+        do {
+            try extractArchive(archive, to: staging)
+        } catch {
+            NSLog("Could not extract the guest root: %@", error.localizedDescription)
+            return
+        }
+
+        guard let entries = fileManager.enumerator(at: staging, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }
+        let base = staging.standardizedFileURL.path
         for case let entry as URL in entries {
             let relative = String(entry.standardizedFileURL.path.dropFirst(base.count + 1))
-            if relative.hasPrefix(".maciOS-root-") { continue }
+            // Written last, so an interrupted install is redone.
+            if relative == installedVersionURL.lastPathComponent { continue }
             let target = rootDirectory.appendingPathComponent(relative)
             let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             do {
@@ -66,35 +86,65 @@ class Execute: NSObject {
                     if (try? fileManager.attributesOfItem(atPath: target.path)) != nil {
                         try fileManager.removeItem(at: target)
                     }
-                    try fileManager.copyItem(at: entry, to: target)
+                    try fileManager.moveItem(at: entry, to: target)
                 }
             } catch {
                 NSLog("Could not install %@ into the guest root: %@", relative, error.localizedDescription)
                 return
             }
         }
-        // Installing the app dropped the files' modes.
-        let executables = (try? String(contentsOf: bundled.appendingPathComponent(".maciOS-root-executables"), encoding: .utf8)) ?? ""
-        for relative in executables.split(separator: "\n") {
-            try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rootDirectory.appendingPathComponent(String(relative)).path)
-        }
-        try? version.write(to: rootDirectory.appendingPathComponent(versionName), atomically: true, encoding: .utf8)
+        try? version.write(to: installedVersionURL, atomically: true, encoding: .utf8)
     }
+
+    private static func extractArchive(_ archive: URL, to directory: URL) throws {
+        struct ArchiveError: LocalizedError {
+            var errorDescription: String? { "could not open the archive" }
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let file = ArchiveByteStream.fileStream(path: FilePath(archive.path), mode: .readOnly, options: [], permissions: FilePermissions(rawValue: 0o644)) else { throw ArchiveError() }
+        defer { try? file.close() }
+        guard let decompressed = ArchiveByteStream.decompressionStream(readingFrom: file) else { throw ArchiveError() }
+        defer { try? decompressed.close() }
+        guard let decoder = ArchiveStream.decodeStream(readingFrom: decompressed) else { throw ArchiveError() }
+        defer { try? decoder.close() }
+        guard let extractor = ArchiveStream.extractStream(extractingTo: FilePath(directory.path)) else { throw ArchiveError() }
+        defer { try? extractor.close() }
+        _ = try ArchiveStream.process(readingFrom: decoder, writingTo: extractor)
+    }
+
+    /// Changed when patched images are made differently, to drop older ones.
+    /// 2: libraries are referred to as @loader_path/name.
+    private static let imageCacheFormat = 2
 
     /// Patched copies of executables that guests start, keyed by the original's path, size and mtime.
     static let imageCacheDirectory = URL.cachesDirectory.appendingPathComponent("GuestImages")
     /// One copy of a patched image per running program, so each gets its own globals.
     static let instanceDirectory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("GuestInstances")
 
-    /// Patches a macOS executable into a loadable dylib and runs it on its own thread.
+    /// Sets up the environment guests run in, installing the guest root.
+    static func prepare() {
+        _ = setUp
+    }
+
+    /// Patches a macOS executable into a loadable dylib and runs it on its own
+    /// thread. `onExit` is called on the main queue with its wait status.
     @discardableResult
-    static func launch(executable url: URL, arguments: [String] = []) -> MachOPatcher {
+    static func launch(executable url: URL, arguments: [String] = [], onExit: ((Int32) -> Void)? = nil) -> MachOPatcher {
         let patcher = MachOPatcher(url)
         _ = setUp
-        if let patched = patcher.patchExecutable() {
-            run(dylibPath: patched.path, programName: url.lastPathComponent, arguments: arguments, executablePath: url.path)
+        if let instance = instantiate(url) {
+            if !run(dylibPath: instance.path, programName: url.lastPathComponent, arguments: arguments, executablePath: url.path, onExit: onExit) {
+                try? FileManager.default.removeItem(at: instance.deletingLastPathComponent())
+            }
         }
         return patcher
+    }
+
+    /// What to do when programs started from the terminal exit, by pid. Main queue only.
+    private static var exitHandlers: [pid_t: (Int32) -> Void] = [:]
+
+    private static func toplevelExited(pid: pid_t, status: Int32) {
+        exitHandlers.removeValue(forKey: pid)?(status)
     }
 
     /// Starts a program that a guest exec'd. Returns 0 once it is running, or an errno value.
@@ -110,15 +160,21 @@ class Execute: NSObject {
         }
         let url = URL(fileURLWithPath: path)
         let arguments = strings(argv)
-        guard let instance = instantiate(url, pid: pid) else { return ENOEXEC }
+        guard let instance = instantiate(url) else { return ENOEXEC }
         let started = run(dylibPath: instance.path, programName: arguments.first ?? url.lastPathComponent, arguments: Array(arguments.dropFirst()), executablePath: path, environment: strings(envp), pid: pid)
         if !started {
-            try? FileManager.default.removeItem(at: instance)
+            try? FileManager.default.removeItem(at: instance.deletingLastPathComponent())
         }
         return started ? 0 : ENOEXEC
     }
 
-    private static func instantiate(_ url: URL, pid: pid_t) -> URL? {
+    private static let instanceCounter = NSLock()
+    private static var instanceCount = 0
+
+    /// A loadable copy of the program at `url` for one run, in a directory of
+    /// its own together with clones of the libraries it uses: a separate image
+    /// for dyld, so the run gets its own globals, as a process would.
+    private static func instantiate(_ url: URL) -> URL? {
         let fileManager = FileManager.default
         guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else { return nil }
         let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
@@ -148,14 +204,21 @@ class Execute: NSObject {
             }
         }
 
-        // A copy has its own inode, so dyld loads it as a new image instead of
-        // handing back one that is already running. On APFS this is a clone.
-        let instance = instanceDirectory.appendingPathComponent("\(url.lastPathComponent)-\(pid).dylib")
-        try? fileManager.removeItem(at: instance)
+        // Copies have their own paths and inodes, so dyld loads them as new
+        // images instead of handing back ones already running. On APFS they are clones.
+        instanceCounter.lock()
+        instanceCount += 1
+        let number = instanceCount
+        instanceCounter.unlock()
+        let directory = instanceDirectory.appendingPathComponent("\(url.lastPathComponent)-\(number)")
+        let instance = directory.appendingPathComponent(url.lastPathComponent + ".dylib")
         do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
             try fileManager.copyItem(at: cached, to: instance)
+            try GuestLibraries.cloneDependencies(of: instance)
         } catch {
-            NSLog("Failed to copy %@: %@", cached.path, error.localizedDescription)
+            NSLog("Failed to prepare %@: %@", url.path, error.localizedDescription)
+            try? fileManager.removeItem(at: directory)
             return nil
         }
         return instance
@@ -165,7 +228,7 @@ class Execute: NSObject {
     /// `pid` is set for programs started by another guest, which run with
     /// `environment` instead of the app's.
     @discardableResult
-    static func run(dylibPath: String, programName: String? = nil, arguments: [String] = [], executablePath: String? = nil, environment: [String]? = nil, pid spawnedPid: pid_t? = nil) -> Bool {
+    static func run(dylibPath: String, programName: String? = nil, arguments: [String] = [], executablePath: String? = nil, environment: [String]? = nil, pid spawnedPid: pid_t? = nil, onExit: ((Int32) -> Void)? = nil) -> Bool {
         NSLog("Attempting to run dylib at path: %@", dylibPath)
 
         guard FileManager.default.fileExists(atPath: dylibPath) else {
@@ -210,8 +273,9 @@ class Execute: NSObject {
             pid = spawnedPid
             guestEnvironment = environment
         } else {
-            pid = guest_register_toplevel()
+            // Before registering, which records the working directory it sets.
             Execute().setEnvironmentVariables()
+            pid = guest_register_toplevel()
             NSLog("Environment variables set.")
             var current: [String] = []
             var entry = environ
@@ -222,7 +286,7 @@ class Execute: NSObject {
             guestEnvironment = current
         }
         let toplevel = spawnedPid == nil
-        if !guest_attach_image(pid, dylibPath, handle, toplevel ? nil : dylibPath) {
+        if !guest_attach_image(pid, dylibPath, handle, dylibPath) {
             NSLog("Failed to attach process hooks for %@", dylibPath)
         }
 
@@ -277,6 +341,9 @@ class Execute: NSObject {
 
         if toplevel {
             guest_save_signal_handlers()
+            if let onExit {
+                DispatchQueue.main.async { exitHandlers[pid] = onExit }
+            }
         }
         thread.start()
         return true
@@ -288,10 +355,10 @@ class Execute: NSObject {
     func setEnvironmentVariables() {
         let userName = NSUserName()
         let documentsDir = URL.documentsDirectory.path
-        let shell = "/bin/zsh"
+        let shell = "/bin/bash"
         let hostname = UIDevice.current.hostname ?? "localhost"
         let tmpDir = NSTemporaryDirectory()
-        let pathEnv = "/bin:/usr/bin:/usr/local/bin:\(documentsDir)/bin"
+        let pathEnv = "\(documentsDir)/homebrew/bin:\(documentsDir)/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\(documentsDir)/bin"
         let launchInstanceID = UUID().uuidString
         let osLogRateLimit = "64"
         let securitySessionID = "18831"
@@ -324,10 +391,8 @@ class Execute: NSObject {
             "XPC_FLAGS": xpcFlags,
             "XPC_SERVICE_NAME": xpcServiceName,
             "__CFBundleIdentifier": cfBundleIdentifier,
-            // Set PS1 properly for zsh
-            "PS1": "%n@%m:%~$ ",
-            // Also set PROMPT for zsh compatibility
-            "PROMPT": "%n@%m:%~$ "
+            // The terminal's shell is bash.
+            "PS1": "\\u@\\h:\\w\\$ "
         ]
 
         for (key, value) in env {
@@ -337,7 +402,7 @@ class Execute: NSObject {
         // Relative paths given to the program should resolve against $HOME, like a shell started there.
         FileManager.default.changeCurrentDirectoryPath(documentsDir)
         
-        NSLog("Environment variables set including PS1 and PROMPT")
+        NSLog("Environment variables set including PS1")
     }
     
     static func getTextSegmentVMAddr(from path: String) -> UInt64? {
@@ -688,29 +753,17 @@ class Execute: NSObject {
     }
 
     static func getMemoryBase(for dylibPath: String) -> UnsafeMutableRawPointer? {
-        let count = _dyld_image_count()
-        let targetName = (dylibPath as NSString).lastPathComponent
-        
-        
-        for i in 0..<count {
+        // By full path: copies of a program for different runs share a name,
+        // and earlier ones may still be loaded.
+        let target = URL(fileURLWithPath: dylibPath).resolvingSymlinksInPath().path
+        for i in 0..<_dyld_image_count() {
             guard let nameC = _dyld_get_image_name(i) else { continue }
             let imageName = String(cString: nameC)
-            let imageBaseName = (imageName as NSString).lastPathComponent
-            
-            
-            let matches = imageName == dylibPath ||
-                         imageBaseName == targetName ||
-                         imageName.hasSuffix(targetName) ||
-                         dylibPath.hasSuffix(imageName)
-            
-            if matches {
-                guard let headerPtr = _dyld_get_image_header(i) else { continue }
-                
-                let base = UnsafeMutableRawPointer(mutating: headerPtr)
-                return base
-            }
+            guard imageName == dylibPath || imageName == target,
+                  let headerPtr = _dyld_get_image_header(i) else { continue }
+            return UnsafeMutableRawPointer(mutating: headerPtr)
         }
-        
+
         NSLog("%@", "No matching image found")
         return nil
     }

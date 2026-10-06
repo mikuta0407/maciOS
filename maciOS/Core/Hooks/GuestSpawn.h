@@ -30,6 +30,13 @@ void guest_set_library_loader(guest_library_loader_t loader);
 /// app's own stdin/stdout/stderr.
 pid_t guest_register_toplevel(void);
 
+/// Called when a program started from the terminal exits, with its wait
+/// status. It runs with the process table locked, so it must only hand the
+/// news on (dispatch_async).
+typedef void (*guest_exit_observer_t)(pid_t pid, int waitStatus);
+
+void guest_set_toplevel_exit_observer(guest_exit_observer_t observer);
+
 /// Installs the process hooks into the image loaded from `imagePath` and
 /// associates it with `pid`. When the program exits, `handle` (from dlopen)
 /// is closed and `instancePath`, if given, is deleted.

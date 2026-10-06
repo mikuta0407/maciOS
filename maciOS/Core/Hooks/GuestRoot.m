@@ -29,8 +29,33 @@ void guest_root_set(const char *path) {
     }
 }
 
+/// A path into an earlier location of the app's data container, which moves
+/// when the app is reinstalled or updated (Homebrew writes absolute paths into
+/// what it installs): the same path in the current container, or NULL.
+static const char *current_container_path(const char *path, char buffer[PATH_MAX]) {
+    static const char marker[] = "/Containers/Data/Application/";
+    static char home[PATH_MAX];
+    static size_t homeLength;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        strlcpy(home, NSHomeDirectory().fileSystemRepresentation, sizeof(home));
+        homeLength = strlen(home);
+    });
+    const char *found = strstr(path, marker);
+    if (!found || homeLength == 0) return NULL;
+    const char *rest = strchr(found + sizeof(marker) - 1, '/');
+    if (!rest) return NULL;
+    size_t containerLength = (size_t)(rest - path);
+    if (containerLength == homeLength && strncmp(path, home, homeLength) == 0) return NULL;
+    if (snprintf(buffer, PATH_MAX, "%s%s", home, rest) >= PATH_MAX) return NULL;
+    return buffer;
+}
+
 const char *guest_root_map(const char *path, char buffer[PATH_MAX]) {
-    if (!path || path[0] != '/' || guest_root_length == 0) return path;
+    if (!path || path[0] != '/') return path;
+    const char *moved = current_container_path(path, buffer);
+    if (moved) return moved;
+    if (guest_root_length == 0) return path;
     if (strncmp(path, guest_root, guest_root_length) == 0) return path;
 
     BOOL eligible = NO, opaque = NO;

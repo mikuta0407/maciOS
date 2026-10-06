@@ -58,41 +58,95 @@ enum GuestLibraries {
         return output.path
     }
 
-    /// A library the program at `executablePath` opens itself. Its imports
-    /// looked up in the main executable or the flat namespace, like a Ruby
-    /// extension's calls into the interpreter, are bound to `programImage`,
-    /// the program's loaded copy: here the main executable is the app, and
-    /// each running copy of the program has its own globals.
+    /// Copies (clones, on APFS) the patched libraries the image at `image`
+    /// needs, directly or not, into its directory, where it looks for them.
+    static func cloneDependencies(of image: URL) throws {
+        let fileManager = FileManager.default
+        let target = image.deletingLastPathComponent()
+        var pending = [image]
+        var seen: Set<String> = []
+        while let next = pending.popLast() {
+            for name in loaderPathDependencies(of: next) where seen.insert(name).inserted {
+                let destination = target.appendingPathComponent(name)
+                if !fileManager.fileExists(atPath: destination.path) {
+                    try fileManager.copyItem(at: directory.appendingPathComponent(name), to: destination)
+                }
+                pending.append(destination)
+            }
+        }
+    }
+
+    /// The names of the libraries the image refers to as @loader_path/name.
+    private static func loaderPathDependencies(of image: URL) -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: image),
+              let head = try? handle.read(upToCount: 64 * 1024) else { return [] }
+        try? handle.close()
+        let headerSize = MemoryLayout<mach_header_64>.size
+        guard head.count >= headerSize else { return [] }
+        return head.withUnsafeBytes { raw -> [String] in
+            let header = raw.loadUnaligned(as: mach_header_64.self)
+            guard header.magic == MH_MAGIC_64, headerSize + Int(header.sizeofcmds) <= raw.count else { return [] }
+            let dylibCommands: Set<UInt32> = [UInt32(LC_LOAD_DYLIB), LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, UInt32(LC_LAZY_LOAD_DYLIB), LC_LOAD_UPWARD_DYLIB]
+            var names: [String] = []
+            var cursor = headerSize
+            for _ in 0..<header.ncmds {
+                let cmd = raw.loadUnaligned(fromByteOffset: cursor, as: UInt32.self)
+                let size = Int(raw.loadUnaligned(fromByteOffset: cursor + 4, as: UInt32.self))
+                guard size >= 8, cursor + size <= raw.count else { break }
+                if dylibCommands.contains(cmd) {
+                    let offset = Int(raw.loadUnaligned(fromByteOffset: cursor + 8, as: UInt32.self))
+                    let bytes = raw[(cursor + offset)..<(cursor + size)].prefix { $0 != 0 }
+                    let name = String(decoding: bytes, as: UTF8.self)
+                    if name.hasPrefix("@loader_path/") {
+                        names.append(String(name.dropFirst("@loader_path/".count)))
+                    }
+                }
+                cursor += size
+            }
+            return names
+        }
+    }
+
+    /// A library the program at `executablePath` opens itself, placed beside
+    /// `programImage`, the program's loaded copy. Its imports looked up in the
+    /// main executable or the flat namespace, like a Ruby extension's calls
+    /// into the interpreter, are bound to that copy: here the main executable
+    /// is the app, and each running copy of the program has its own globals.
     static func loadable(_ path: String, programImage: String, executablePath: String) -> String? {
-        let systemPrefixes = ["/usr/lib/", "/System/", Bundle.main.bundlePath + "/"]
-        guard !systemPrefixes.contains(where: path.hasPrefix),
+        // System libraries, and images that are already patched copies.
+        let loadablePrefixes = ["/usr/lib/", "/System/", Bundle.main.bundlePath + "/",
+                                Execute.imageCacheDirectory.path + "/", Execute.instanceDirectory.path + "/"]
+        guard !loadablePrefixes.contains(where: path.hasPrefix),
               FileManager.default.fileExists(atPath: path),
               let patched = patched(path, executablePath: executablePath, rpaths: []),
               var data = try? Data(contentsOf: URL(fileURLWithPath: patched)) else { return nil }
 
         lock.lock()
         defer { lock.unlock() }
-        let bound = Execute.instanceDirectory.appendingPathComponent(
-            "\(URL(fileURLWithPath: patched).deletingPathExtension().lastPathComponent)-\(URL(fileURLWithPath: programImage).deletingPathExtension().lastPathComponent).dylib")
-        if FileManager.default.fileExists(atPath: bound.path) { return bound.path }
-        switch MachOPatcher.bindProgramLookups(in: &data, to: programImage) {
-        case nil:
-            NSLog("Cannot bind %@ to %@", path, programImage)
-            return patched
-        case false?:
-            return patched
-        case true?:
-            let staging = Execute.instanceDirectory.appendingPathComponent(UUID().uuidString + ".dylib")
-            do {
+        let fileManager = FileManager.default
+        // Beside the program's copy, with clones of what it needs.
+        let directory = URL(fileURLWithPath: programImage).deletingLastPathComponent()
+        let target = directory.appendingPathComponent((patched as NSString).lastPathComponent)
+        if fileManager.fileExists(atPath: target.path) { return target.path }
+        let staging = directory.appendingPathComponent(UUID().uuidString + ".dylib")
+        do {
+            switch MachOPatcher.bindProgramLookups(in: &data, to: programImage) {
+            case true?:
                 try data.write(to: staging)
                 MachOPatcher(staging, output: staging).finishPatching()
-                try FileManager.default.moveItem(at: staging, to: bound)
-                return bound.path
-            } catch {
-                try? FileManager.default.removeItem(at: staging)
-                NSLog("Error writing %@: %@", bound.path, error.localizedDescription)
-                return nil
+            case false?:
+                try fileManager.copyItem(at: URL(fileURLWithPath: patched), to: staging)
+            case nil:
+                NSLog("Cannot bind %@ to %@", path, programImage)
+                try fileManager.copyItem(at: URL(fileURLWithPath: patched), to: staging)
             }
+            try fileManager.moveItem(at: staging, to: target)
+            try cloneDependencies(of: target)
+            return target.path
+        } catch {
+            try? fileManager.removeItem(at: staging)
+            NSLog("Error preparing %@ for %@: %@", path, programImage, error.localizedDescription)
+            return nil
         }
     }
 }
@@ -458,9 +512,12 @@ extension MachOPatcher {
                 continue
             }
 
+            // By name next to the image: each program gets clones of its
+            // libraries beside its own copy (Execute.instantiate), so their
+            // globals are its own, as in a process of its own.
             let header = bytes.prefix(MemoryLayout<dylib_command>.size)
             var replacement = Data(header)
-            replacement.append(contentsOf: Array(patched.utf8) + [0])
+            replacement.append(contentsOf: Array(("@loader_path/" + (patched as NSString).lastPathComponent).utf8) + [0])
             while replacement.count % 8 != 0 { replacement.append(0) }
             replacement.withUnsafeMutableBytes { raw in
                 raw.storeBytes(of: UInt32(raw.count), toByteOffset: 4, as: UInt32.self)
